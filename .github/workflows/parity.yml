@@ -1,0 +1,221 @@
+name: Parity Suite
+
+# Runs the upstream ClusterShell parity suite (this repo) against the
+# consortium Rust implementation (sibling checkout). Adapted from
+# consortium's migration-scorecard.yml for the split-repo layout.
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore:
+      - '.gitignore'
+      - 'doc-legacy/**'
+      - 'README.md'
+  pull_request:
+    branches: [main, master, develop]
+    paths-ignore:
+      - '.gitignore'
+      - 'doc-legacy/**'
+      - 'README.md'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ClusterShell ref to test against (default: pinned in UPSTREAM_REF)"
+        required: false
+        default: ""
+      consortium_ref:
+        description: "consortium repo ref to check out (default: its master)"
+        required: false
+        default: ""
+
+jobs:
+  # ── Layer 1: Unit Tests & Migration Scorecard ─────────────────────
+  scorecard:
+    name: Unit Tests & Migration Scorecard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: consortium-tests
+    steps:
+      # Sibling-checkout layout: both repos side by side under
+      # $GITHUB_WORKSPACE so ../consortium path deps resolve.
+      - uses: actions/checkout@v4
+        with:
+          path: consortium-tests
+
+      - name: Check out consortium (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: olivecasazza/consortium
+          ref: ${{ github.event.inputs.consortium_ref || '' }}
+          path: consortium
+
+      # ── Toolchains ─────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install virtualenv
+          python -m virtualenv .venv
+          source .venv/bin/activate
+          pip install pytest pytest-timeout pytest-xdist maturin pyyaml
+
+      # ── Upstream sync ──────────────────────────────────────────
+      - name: Sync upstream tests
+        run: |
+          REF="${{ github.event.inputs.upstream_ref }}"
+          if [ -z "$REF" ]; then
+            bash harness/sync_upstream_tests.sh
+          else
+            bash harness/sync_upstream_tests.sh "$REF"
+          fi
+
+      # ── Build ──────────────────────────────────────────────────
+      - name: Build PyO3 bindings
+        working-directory: consortium/crates/consortium-py
+        run: |
+          source "$GITHUB_WORKSPACE/consortium-tests/.venv/bin/activate"
+          maturin develop --release
+
+      # ── Rust unit tests ────────────────────────────────────────
+      - name: Run Rust unit tests
+        continue-on-error: true
+        env:
+          CONSORTIUM_REPO: ../consortium
+        run: |
+          mkdir -p results
+          source .venv/bin/activate
+          cargo nextest run \
+            --manifest-path ../consortium/Cargo.toml \
+            -p consortium-crate \
+            --profile ci \
+            --no-fail-fast \
+            2>&1 | tee results/rust-raw.txt
+
+          # Generate JUnit XML from cargo test output
+          cargo test --manifest-path ../consortium/Cargo.toml -p consortium-crate 2>&1 | \
+            python harness/cargo_to_junit.py > results/rust-unit.xml
+
+      # ── Python tests: original backend ─────────────────────────
+      - name: Run Python tests (original backend)
+        continue-on-error: true
+        env:
+          CONSORTIUM_BACKEND: python
+          PYTHONPATH: ${{ github.workspace }}/consortium-tests/lib
+          LIB_CLUSTERSHELL: ${{ github.workspace }}/consortium-tests/lib
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ -v \
+            --timeout=30 \
+            --tb=short \
+            --junit-xml=results/python-original.xml \
+            || true
+
+      # ── Python tests: Rust backend ─────────────────────────────
+      - name: Run Python tests (Rust backend)
+        continue-on-error: true
+        env:
+          CONSORTIUM_BACKEND: rust
+          LIB_CLUSTERSHELL: ${{ github.workspace }}/consortium-tests/lib
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ -v \
+            --timeout=30 \
+            --tb=short \
+            --junit-xml=results/python-rust.xml \
+            || true
+
+      # ── Generate scorecard ─────────────────────────────────────
+      - name: Generate test mapping
+        env:
+          CONSORTIUM_REPO: ../consortium
+        run: python harness/generate_test_mapping.py --update
+
+      - name: Render scorecard
+        run: python harness/render_summary.py --results-dir=results >> $GITHUB_STEP_SUMMARY
+
+      # ── Upload artifacts ───────────────────────────────────────
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-results
+          path: |
+            consortium-tests/results/
+            consortium-tests/TEST_MAPPING.toml
+          retention-days: 30
+
+  # ── Layer 2: Integration Tests (Docker, runs after unit tests) ────
+  integration:
+    name: Docker Integration Tests
+    needs: scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: consortium-tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: consortium-tests
+
+      - name: Check out consortium (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: olivecasazza/consortium
+          ref: ${{ github.event.inputs.consortium_ref || '' }}
+          path: consortium
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            consortium-tests/target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Generate SSH keys for test containers
+        run: |
+          mkdir -p tests/docker/ssh
+          ssh-keygen -t ed25519 -f tests/docker/ssh/id_ed25519 -N "" -q
+          cp tests/docker/ssh/id_ed25519.pub tests/docker/ssh/authorized_keys
+
+      - name: Build Docker SSH node image
+        run: |
+          docker build -t consortium-ssh-node -f tests/docker/Dockerfile.ssh-node tests/docker/
+
+      - name: Run integration tests (small cluster — 6 nodes)
+        run: |
+          cargo test -p consortium-integration-tests \
+            --features docker-tests \
+            --test docker_integration \
+            -- --test-threads=1 \
+            -Z unstable-options --format json 2>&1 | tee results-integration.json || true
+
+      - name: Run integration tests (large cluster — 33 nodes)
+        run: |
+          cargo test -p consortium-integration-tests \
+            --features docker-tests \
+            --test docker_integration \
+            "test_scale" \
+            -- --test-threads=1 || true
+
+      - name: Cleanup Docker containers
+        if: always()
+        run: |
+          docker ps -a --filter "name=consortium-test" -q | xargs -r docker rm -f
+          docker network ls --filter "name=consortium-test" -q | xargs -r docker network rm

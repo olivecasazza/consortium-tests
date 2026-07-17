@@ -1,0 +1,16 @@
+[package]
+name = "consortium-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Docker-based integration tests for consortium (moved from crates/consortium/tests)"
+publish = false
+
+[features]
+docker-tests = []
+
+[dev-dependencies]
+consortium.workspace = true
+consortium-nix.workspace = true
+consortium-test-harness.workspace = true

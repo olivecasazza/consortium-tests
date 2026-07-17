@@ -4,12 +4,15 @@ from __future__ import annotations
 collect JUnit XML results for the scorecard.
 
 Usage:
-    python harness/run_comparison.py [--results-dir=./results]
+    python harness/run_comparison.py [--results-dir=./results] [--consortium-repo=../consortium]
 
 Produces:
     results/python-original.xml   — Python tests against pure-Python ClusterShell
     results/python-rust.xml       — Python tests against Rust (PyO3) backend
     results/rust-unit.xml         — Pure Rust unit tests (cargo-nextest or cargo test)
+
+Split-repo layout: the Rust workspace lives in the sibling consortium repo.
+Resolution order: --consortium-repo flag, $CONSORTIUM_REPO, ../consortium.
 
 Exit code: always 0 (we want all results even if tests fail).
 """
@@ -20,6 +23,16 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_consortium_repo(cli_value: str | None) -> Path:
+    """Locate the consortium repo checkout (see module docstring).
+
+    Relative paths are resolved against the current working directory —
+    run from the consortium-tests root so the default ../consortium works.
+    """
+    raw = cli_value or os.environ.get("CONSORTIUM_REPO") or "../consortium"
+    return Path(raw).resolve()
 
 
 def run_cmd(cmd: list[str], env: dict | None = None, cwd: str | None = None) -> int:
@@ -41,10 +54,16 @@ def run_cmd(cmd: list[str], env: dict | None = None, cwd: str | None = None) -> 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results", help="Directory for JUnit XML outputs")
+    parser.add_argument("--consortium-repo", default=None,
+                        help="Path to the consortium checkout (default: $CONSORTIUM_REPO or ../consortium)")
     parser.add_argument("--skip-python-original", action="store_true", help="Skip Python original backend tests")
     parser.add_argument("--skip-python-rust", action="store_true", help="Skip Python rust-backed tests")
     parser.add_argument("--skip-rust-unit", action="store_true", help="Skip pure Rust unit tests")
     args = parser.parse_args()
+
+    consortium_repo = resolve_consortium_repo(args.consortium_repo)
+    consortium_manifest = consortium_repo / "Cargo.toml"
+    consortium_py = consortium_repo / "crates" / "consortium-py"
 
     results_dir = REPO_ROOT / args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -63,7 +82,8 @@ def main():
             pytest_base + [f"--junit-xml={results_dir}/python-original.xml"],
             env={
                 "CONSORTIUM_BACKEND": "python",
-                "PYTHONPATH": f"{REPO_ROOT}/lib:{REPO_ROOT}/crates/consortium-py",
+                "PYTHONPATH": f"{REPO_ROOT}/lib:{consortium_py}",
+                "LIB_CLUSTERSHELL": f"{REPO_ROOT}/lib",
             },
         )
         print(f"  → Python (original): exit code {rc}")
@@ -74,7 +94,8 @@ def main():
             pytest_base + [f"--junit-xml={results_dir}/python-rust.xml"],
             env={
                 "CONSORTIUM_BACKEND": "rust",
-                "PYTHONPATH": f"{REPO_ROOT}/crates/consortium-py",
+                "PYTHONPATH": f"{consortium_py}",
+                "LIB_CLUSTERSHELL": f"{REPO_ROOT}/lib",
             },
         )
         print(f"  → Python (rust-backed): exit code {rc}")
@@ -84,21 +105,23 @@ def main():
         # Try cargo-nextest first (better JUnit output), fall back to cargo test
         nextest_available = subprocess.run(
             ["cargo", "nextest", "--version"],
-            capture_output=True, cwd=str(REPO_ROOT),
+            capture_output=True, cwd=str(consortium_repo),
         ).returncode == 0
 
         if nextest_available:
             rc = run_cmd([
                 "cargo", "nextest", "run",
-                "-p", "consortium",
+                "--manifest-path", str(consortium_manifest),
+                "-p", "consortium-crate",
                 "--profile", "ci",
                 f"--junit-xml={results_dir}/rust-unit.xml",
             ])
         else:
             # cargo test doesn't natively output JUnit, so we parse its output
             proc = subprocess.run(
-                ["cargo", "test", "-p", "consortium", "--", "--format=terse"],
-                capture_output=True, text=True, cwd=str(REPO_ROOT),
+                ["cargo", "test", "--manifest-path", str(consortium_manifest),
+                 "-p", "consortium-crate", "--", "--format=terse"],
+                capture_output=True, text=True, cwd=str(consortium_repo),
             )
             rc = proc.returncode
             # Generate a simple JUnit XML from cargo test output

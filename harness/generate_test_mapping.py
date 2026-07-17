@@ -4,11 +4,19 @@ from __future__ import annotations
 produce TEST_MAPPING.toml mapping every Python test to its Rust counterpart(s).
 
 Usage:
-    python harness/generate_test_mapping.py [--update]
+    python harness/generate_test_mapping.py [--update] [--consortium-repo=../consortium]
 
 Without --update: prints the mapping to stdout.
 With --update: writes TEST_MAPPING.toml (preserving manual Rust mappings).
+
+The Rust tests live in the sibling consortium repo (split-repo layout).
+Resolution order for the consortium checkout:
+    1. --consortium-repo CLI flag
+    2. CONSORTIUM_REPO environment variable
+    3. ../consortium (relative to the current working directory —
+       run from the consortium-tests root)
 """
+import argparse
 import ast
 import os
 import re
@@ -27,6 +35,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 MAPPING_FILE = REPO_ROOT / "TEST_MAPPING.toml"
+
+
+def resolve_consortium_repo(cli_value: str | None) -> Path:
+    """Locate the consortium repo checkout (see module docstring).
+
+    Relative paths are resolved against the current working directory —
+    run from the consortium-tests root so the default ../consortium works.
+    """
+    raw = cli_value or os.environ.get("CONSORTIUM_REPO") or "../consortium"
+    return Path(raw).resolve()
 
 
 def scan_python_tests() -> dict[str, list[str]]:
@@ -56,16 +74,18 @@ def scan_python_tests() -> dict[str, list[str]]:
     return result
 
 
-def scan_rust_tests() -> list[str]:
+def scan_rust_tests(consortium_repo: Path) -> list[str]:
     """Run `cargo test -- --list` on the core and CLI crates, extract test names."""
+    manifest = consortium_repo / "Cargo.toml"
     tests = []
     for package in ("consortium-crate", "consortium-cli"):
         try:
             proc = subprocess.run(
-                ["cargo", "test", "-p", package, "--", "--list"],
+                ["cargo", "test", "--manifest-path", str(manifest),
+                 "-p", package, "--", "--list"],
                 capture_output=True,
                 text=True,
-                cwd=str(REPO_ROOT),
+                cwd=str(consortium_repo),
                 timeout=60,
             )
             for line in proc.stdout.splitlines():
@@ -122,10 +142,12 @@ def format_toml_value(val) -> str:
     return str(val)
 
 
-def generate_mapping(update: bool = False):
+def generate_mapping(update: bool = False, consortium_repo: Path | None = None):
     """Generate the full mapping."""
+    if consortium_repo is None:
+        consortium_repo = resolve_consortium_repo(None)
     python_tests = scan_python_tests()
-    rust_tests = scan_rust_tests()
+    rust_tests = scan_rust_tests(consortium_repo)
     existing = load_existing_mapping() if update else {}
 
     # Stats
@@ -138,7 +160,7 @@ def generate_mapping(update: bool = False):
     lines.append("# Maps every upstream Python test to its Rust counterpart(s).")
     lines.append("# Empty arrays mean the test is not yet ported to Rust.")
     lines.append("#")
-    lines.append("# Regenerate: python harness/generate_test_mapping.py --update")
+    lines.append("# Regenerate: python harness/generate_test_mapping.py --update [--consortium-repo=../consortium]")
     lines.append("")
 
     lines.append("[upstream]")
@@ -219,5 +241,12 @@ def generate_mapping(update: bool = False):
 
 
 if __name__ == "__main__":
-    update = "--update" in sys.argv
-    generate_mapping(update=update)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--update", action="store_true",
+                        help="Write TEST_MAPPING.toml instead of printing to stdout")
+    parser.add_argument("--consortium-repo", default=None,
+                        help="Path to the consortium checkout (default: $CONSORTIUM_REPO or ../consortium)")
+    args = parser.parse_args()
+    generate_mapping(update=args.update,
+                     consortium_repo=resolve_consortium_repo(args.consortium_repo))

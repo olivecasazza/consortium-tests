@@ -258,10 +258,12 @@ impl DockerCluster {
     }
 
     fn docker_dir() -> PathBuf {
+        // CARGO_MANIFEST_DIR is set to the *test* package's manifest dir when
+        // cargo runs a test target. After the repo split, the consumer is
+        // consortium-tests/integration-tests, so the docker assets at
+        // consortium-tests/tests/docker are one level up.
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(manifest)
-            .parent()
-            .unwrap()
             .parent()
             .unwrap()
             .join("tests")

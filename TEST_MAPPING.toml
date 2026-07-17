@@ -2,7 +2,7 @@
 # Maps every upstream Python test to its Rust counterpart(s).
 # Empty arrays mean the test is not yet ported to Rust.
 #
-# Regenerate: python harness/generate_test_mapping.py --update
+# Regenerate: python harness/generate_test_mapping.py --update [--consortium-repo=../consortium]
 
 [upstream]
 repo = "cea-hpc/clustershell"
@@ -1212,8 +1212,6 @@ test_list_group = []
 # task::tests::test_task_with_custom_handler
 # task::tests::test_task_worker_accessor
 # task::tests::test_task_worker_retcodes_accessor
-# test_045_pipe_line_buffering
-# test_046_axis
 # test_eval_all_nodes
 # test_eval_by_tag
 # test_eval_shows_target_details
@@ -1358,4 +1356,4 @@ test_list_group = []
 # worker::tree::tests::test_tree_worker_unique_ids
 # worker::tree::tests::test_untar_command_quoting
 
-# Summary: 726 Python tests, 96 mapped, 630 unmapped, 515 extra Rust tests
+# Summary: 726 Python tests, 96 mapped, 630 unmapped, 513 extra Rust tests

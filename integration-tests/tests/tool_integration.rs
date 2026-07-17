@@ -3,7 +3,7 @@
 //! These tests use specialized Docker images (nix-node, ansible-node)
 //! and verify that the actual tools work through the DAG executor.
 //!
-//!   cargo test -p consortium --features docker-tests --test tool_integration -- --test-threads=1
+//!   cargo test -p consortium-integration-tests --features docker-tests --test tool_integration -- --test-threads=1
 
 #![cfg(feature = "docker-tests")]
 
@@ -19,10 +19,10 @@ fn ssh_opts() -> &'static str {
 }
 
 fn ssh_key() -> String {
+    // CARGO_MANIFEST_DIR = consortium-tests/integration-tests; the docker
+    // assets live at consortium-tests/tests/docker (one level up).
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let key = std::path::PathBuf::from(manifest)
-        .parent()
-        .unwrap()
         .parent()
         .unwrap()
         .join("tests/docker/ssh/id_ed25519");
@@ -32,8 +32,6 @@ fn ssh_key() -> String {
 fn docker_dir() -> std::path::PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(manifest)
-        .parent()
-        .unwrap()
         .parent()
         .unwrap()
         .join("tests/docker")

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "test-harness",
+    "integration-tests",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/olivecasazza/consortium-tests"
+description = "Test infrastructure for consortium — ClusterShell parity suite + Docker integration tests"
+
+# Sibling-checkout layout: this repo expects the consortium repo checked out
+# at ../consortium (see README.md).
+[workspace.dependencies]
+consortium = { path = "../consortium/crates/consortium", package = "consortium-crate", version = "0.2.0" }
+consortium-nix = { path = "../consortium/crates/consortium-nix", version = "0.2.0" }
+consortium-test-harness = { path = "test-harness", version = "0.2.0" }
