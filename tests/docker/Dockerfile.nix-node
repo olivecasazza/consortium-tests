@@ -1,0 +1,32 @@
+FROM nixos/nix:latest
+
+# Enable flakes and configure nix for builder use
+RUN mkdir -p /etc/nix && \
+    echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
+    echo "sandbox = false" >> /etc/nix/nix.conf && \
+    echo "trusted-users = root" >> /etc/nix/nix.conf && \
+    echo "accept-flake-config = true" >> /etc/nix/nix.conf
+
+# Install openssh
+RUN nix-env -iA nixpkgs.openssh nixpkgs.gnused
+
+# Create sshd privilege separation user, unlock root, write sshd_config
+RUN mkdir -p /etc/ssh /root/.ssh /run /var/empty && \
+    chmod 700 /root/.ssh && \
+    echo "sshd:x:74:74:sshd privsep:/var/empty:/bin/false" >> /etc/passwd && \
+    echo "sshd:x:74:" >> /etc/group && \
+    sed -i 's/^root:!/root:*/' /etc/shadow && \
+    printf 'Port 22\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nPubkeyAuthentication yes\nStrictModes no\n' > /etc/ssh/sshd_config && \
+    ssh-keygen -A
+
+# Create a minimal flake for testing builds
+RUN mkdir -p /test-flake && \
+    printf '{\n  description = "Test flake for consortium integration tests";\n  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";\n  outputs = { nixpkgs, ... }: let\n    pkgs = nixpkgs.legacyPackages.x86_64-linux;\n  in {\n    packages.x86_64-linux.hello = pkgs.hello;\n    packages.x86_64-linux.test-derivation = pkgs.writeText "test-output" "built-by-consortium";\n  };\n}\n' > /test-flake/flake.nix
+
+EXPOSE 22
+
+# Wrapper that sets PATH for nix binaries before starting sshd
+RUN printf '#!/bin/bash\nexport PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH"\necho "PATH=$PATH" > /etc/environment\necho "SetEnv PATH=$PATH" >> /etc/ssh/sshd_config\nexec /root/.nix-profile/bin/sshd -D -e -f /etc/ssh/sshd_config\n' > /start-sshd.sh && \
+    chmod +x /start-sshd.sh
+
+CMD ["/root/.nix-profile/bin/bash", "/start-sshd.sh"]

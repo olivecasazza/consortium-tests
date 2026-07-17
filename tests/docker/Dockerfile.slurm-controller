@@ -1,0 +1,39 @@
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    openssh-server \
+    bash \
+    coreutils \
+    slurm \
+    slurm-slurmctld \
+    slurm-slurmd \
+    munge \
+    && ssh-keygen -A \
+    && mkdir -p /root/.ssh /run/munge /var/log/slurm /var/spool/slurm /var/spool/slurmd \
+    && chmod 700 /root/.ssh \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && echo "StrictModes no" >> /etc/ssh/sshd_config
+
+# Generate munge key
+RUN dd if=/dev/urandom of=/etc/munge/munge.key bs=1024 count=1 2>/dev/null \
+    && chmod 400 /etc/munge/munge.key \
+    && chown munge:munge /etc/munge/munge.key
+
+EXPOSE 22 6817 6818
+
+# Start script: munge + slurmctld + slurmd + sshd
+RUN cat > /start.sh << 'EOF'
+#!/bin/bash
+munged --force
+sleep 1
+slurmctld -D &
+slurmd -D &
+/usr/sbin/sshd -D -e
+EOF
+RUN chmod +x /start.sh
+
+HEALTHCHECK --interval=2s --timeout=2s --retries=30 \
+    CMD sinfo -h 2>/dev/null | grep -q . || exit 1
+
+CMD ["/start.sh"]

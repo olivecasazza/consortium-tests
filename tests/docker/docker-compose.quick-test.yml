@@ -1,0 +1,27 @@
+x-ssh-node: &ssh-node
+  image: consortium-ssh-node
+  volumes:
+    - ./ssh/authorized_keys:/root/.ssh/authorized_keys:ro
+  networks:
+    - cluster
+
+services:
+  node-01:
+    <<: *ssh-node
+    hostname: node-01
+    ports:
+      - "2301:22"
+  node-02:
+    <<: *ssh-node
+    hostname: node-02
+    ports:
+      - "2302:22"
+  node-03:
+    <<: *ssh-node
+    hostname: node-03
+    ports:
+      - "2303:22"
+
+networks:
+  cluster:
+    driver: bridge

@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["*Test.py"]
+python_classes = ["*Test"]
+python_functions = ["test*"]
+timeout = 30

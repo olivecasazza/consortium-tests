@@ -1,0 +1,22 @@
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    openssh-server \
+    bash \
+    coreutils \
+    python3 \
+    py3-pip \
+    && pip3 install --break-system-packages ansible-core \
+    && ssh-keygen -A \
+    && mkdir -p /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && echo "StrictModes no" >> /etc/ssh/sshd_config
+
+EXPOSE 22
+
+HEALTHCHECK --interval=1s --timeout=1s --retries=30 \
+    CMD nc -z localhost 22
+
+CMD ["/usr/sbin/sshd", "-D", "-e"]
