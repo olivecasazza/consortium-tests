@@ -1,0 +1,107 @@
+name: ai-item-review
+
+# Generic reusable AI review gate.
+#
+# Takes any items JSON (as a workflow artifact) plus free-form review
+# instructions, asks a Z.AI GLM model for a strict-JSON plan, and returns
+# the plan as an artifact. The model NEVER touches the repo or the GitHub
+# API — it only shapes JSON. The caller decides what the plan means and
+# validates its shape (fail-loud).
+#
+# Reuse from any repo:
+#
+#   jobs:
+#     review:
+#       uses: olivecasazza/consortium-tests/.github/workflows/ai-item-review.yml@master
+#       with:
+#         items_artifact: my-items          # artifact containing items.json
+#         instructions: |
+#           Review these items. Respond with STRICT JSON: {"verdict": ...}
+#         model: glm-5.2                    # optional
+#       secrets:
+#         ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+#
+# Then download the `ai-review-plan` artifact (plan.json) in a later job.
+
+on:
+  workflow_call:
+    inputs:
+      items_artifact:
+        description: "Artifact name containing the items JSON to review"
+        required: true
+        type: string
+      items_file:
+        description: "Items JSON filename inside the artifact"
+        required: false
+        type: string
+        default: "items.json"
+      instructions:
+        description: "Review instructions; must demand strict JSON output"
+        required: true
+        type: string
+      model:
+        description: "Z.AI model id"
+        required: false
+        type: string
+        default: "glm-5.2"
+      plan_artifact:
+        description: "Artifact name for the resulting plan.json"
+        required: false
+        type: string
+        default: "ai-review-plan"
+    secrets:
+      ZAI_API_KEY:
+        description: "Z.AI API key (https://docs.z.ai)"
+        required: true
+      REVIEWER_REPO_TOKEN:
+        description: "Only needed when calling from another repo and this repo is private"
+        required: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download items
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.items_artifact }}
+          path: review-in
+
+      - name: Fetch reviewer script
+        uses: actions/checkout@v4
+        with:
+          repository: olivecasazza/consortium-tests
+          token: ${{ secrets.REVIEWER_REPO_TOKEN || github.token }}
+          sparse-checkout: .github/scripts
+          path: reviewer
+
+      - name: Run Z.AI review
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          INSTRUCTIONS: ${{ inputs.instructions }}
+        run: |
+          if [ -z "$ZAI_API_KEY" ]; then
+            echo "::error::ZAI_API_KEY secret is not set on this repository"
+            exit 1
+          fi
+          python3 reviewer/.github/scripts/zai_review.py \
+            --items "review-in/${{ inputs.items_file }}" \
+            --instructions "$INSTRUCTIONS" \
+            --model "${{ inputs.model }}" \
+            --out review-out/plan.json
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plan_artifact }}
+          path: review-out/plan.json
+          if-no-files-found: error
+
+      - name: Summarize
+        run: |
+          {
+            echo "### AI review plan (\`${{ inputs.model }}\`)"
+            echo '```json'
+            cat review-out/plan.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

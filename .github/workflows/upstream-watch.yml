@@ -1,0 +1,132 @@
+name: upstream-watch
+
+# Weekly ClusterShell upstream watch with an AI review gate.
+#
+#   detect  — diff vendored UPSTREAM_REF against cea-hpc/clustershell tip,
+#             categorize new commits (conventional-commit categories) and
+#             extract new test items into items.json
+#   review  — Z.AI GLM-5.2 reviews the items AND the issue split via the
+#             generic reusable ai-item-review workflow; if the model does
+#             not return valid strict JSON the run fails here and NOTHING
+#             is filed or synced (fail-loud gate, retries next week)
+#   file    — validate the plan strictly (full sha coverage, known
+#             categories), file one GitHub issue per plan entry, skip
+#             commits the model marked non-actionable, sync vendored
+#             lib/ tests/ conf/, bump UPSTREAM_REF, commit and push
+#
+# Required repo secret:  ZAI_API_KEY  (https://docs.z.ai)
+# Optional repo variable: none — GITHUB_TOKEN covers issues + push.
+
+on:
+  schedule:
+    - cron: "41 15 * * 1"   # Mondays 15:41 UTC (off-peak)
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max commits to process this run (0 = default 50)"
+        required: false
+        type: number
+        default: 0
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.detect.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect upstream changes
+        id: detect
+        env:
+          LIMIT: ${{ inputs.limit || 0 }}
+        run: |
+          EXTRA=""
+          [ "$LIMIT" != "0" ] && EXTRA="--limit $LIMIT"
+          python3 .agents/skills/upstream-sync-watch/scripts/upstream_sync_watch.py \
+            --json-items items.json $EXTRA
+          COUNT=$(python3 -c "import json; print(len(json.load(open('items.json'))['items']))")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Detected **$COUNT** unprocessed upstream commit(s)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload items
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-items
+          path: items.json
+          if-no-files-found: error
+
+  review:
+    needs: detect
+    if: needs.detect.outputs.count != '0'
+    uses: ./.github/workflows/ai-item-review.yml
+    secrets:
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+    with:
+      items_artifact: upstream-items
+      model: glm-5.2
+      instructions: |
+        You are the weekly upstream-sync reviewer for the consortium project
+        (a Rust reimplementation of the ClusterShell toolchain; the
+        consortium-tests repo vendors cea-hpc/clustershell and tracks
+        behavior parity).
+
+        ITEMS is a JSON object with an "items" array: one entry per new
+        upstream commit touching lib/, tests/, or conf/ — with sha, date,
+        subject, body, files, an auto-assigned conventional-commit category,
+        new_test_files, and test_items (newly added test functions).
+
+        Your tasks:
+        1. Sanity-check each auto-assigned category; recategorize where wrong.
+        2. Decide the issue split. Default is one GitHub issue per commit,
+           but you MAY merge commits that form a single logical change (e.g.
+           a feature and its tests) into one issue. Give each issue a clear
+           imperative title (<= 90 chars).
+        3. Mark non-actionable commits (typo-only, merge churn, changes
+           irrelevant to a Python-behavior parity port) in "skip" with a
+           rationale.
+
+        Respond with STRICT JSON only (no prose, no markdown fences):
+        {
+          "issues": [
+            {"category": "feat|fix|perf|refactor|test|ci|build|docs|style|chore|revert|other",
+             "title": "imperative title",
+             "shas": ["<full sha from items>"],
+             "rationale": "why grouped / what matters for the Rust port"}
+          ],
+          "skip": [{"sha": "<full sha>", "rationale": "why non-actionable"}]
+        }
+
+        Rules: every sha from items MUST appear exactly once across
+        issues[].shas and skip[].sha. Use the full shas exactly as given.
+        Do not invent shas. Empty "issues" and "skip" arrays are allowed.
+
+  file:
+    needs: review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-plan
+          path: .
+
+      - name: File issues, sync content, push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIMIT: ${{ inputs.limit || 0 }}
+        run: |
+          EXTRA=""
+          [ "$LIMIT" != "0" ] && EXTRA="--limit $LIMIT"
+          python3 .agents/skills/upstream-sync-watch/scripts/upstream_sync_watch.py \
+            --plan plan.json --commit-push $EXTRA
