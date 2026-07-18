@@ -24,3 +24,6 @@ tests/docker/docker-compose.generated.yml
 .DS_Store
 .idea/
 .vscode/
+
+# Local secrets (GITHUB_TOKEN for upstream-sync-watch)
+.env.local
