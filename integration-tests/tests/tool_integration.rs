@@ -275,28 +275,25 @@ fn test_nix_cache_hit_skips_rebuild() {
     ));
     assert!(wait_ssh(port, 30));
 
-    // First build
-    let (ok, path1, _) = ssh_run(
+    // Populate the store with the first build.
+    let (ok, path1, stderr1) = ssh_run(
         port,
         "cd /test-flake && nix build .#test-derivation --no-link --print-out-paths",
     );
-    assert!(ok);
+    assert!(ok, "first nix build failed: {}", stderr1);
 
-    // Second build should be instant (cached)
-    let start = std::time::Instant::now();
-    let (ok2, path2, _) = ssh_run(
+    // Disable both local builders and network access. The command can now
+    // succeed only if the first build's output is already valid in the store.
+    let (ok2, path2, stderr2) = ssh_run(
         port,
-        "cd /test-flake && nix build .#test-derivation --no-link --print-out-paths",
+        "cd /test-flake && nix build .#test-derivation --no-link --print-out-paths --offline --option max-jobs 0",
     );
-    let elapsed = start.elapsed();
-    assert!(ok2);
-    assert_eq!(path1, path2, "cached build should produce same path");
-    // Cached build should be very fast
     assert!(
-        elapsed < Duration::from_secs(5),
-        "cached build took {:?}, expected near-instant",
-        elapsed
+        ok2,
+        "cached nix build tried to rebuild or substitute: {}",
+        stderr2
     );
+    assert_eq!(path1, path2, "cached build should produce same path");
 
     stop_container("nix-int-cache");
 }
