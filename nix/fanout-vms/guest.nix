@@ -149,9 +149,8 @@ in
   boot.initrd.verbose = false;
 
   # The fleet restores from a snapshot captured after boot (bench.py). Zeroing
-  # pages on free means the pre-capture cache drop leaves zero pages, which
-  # mapped-ram migration omits: a smaller state file, and restored VMs only
-  # touch the pages that hold data.
+  # pages on free keeps the pre-capture cache drop from leaving stale data in
+  # the captured RAM image.
   boot.kernelParams = [ "init_on_free=1" ];
 
   systemd.services.fanout-health = {

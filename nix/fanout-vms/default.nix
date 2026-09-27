@@ -52,5 +52,6 @@ let
 in
 {
   inherit configuration guestSystem runner;
+  guestMemMiB = configuration.config.microvm.mem;
   defaultPayload = guestPkgs.hello;
 }

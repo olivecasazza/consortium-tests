@@ -67,6 +67,7 @@
               exec ${python}/bin/python3 ${./nix/fanout-vms/bench.py} \
                 --runner ${lib.getExe fanout.runner} \
                 --restore-runner ${lib.getExe' fanout.runner "microvm-restore"} \
+                --guest-mem-mib ${toString fanout.guestMemMiB} \
                 --ssh-key ${./nix/fanout-vms/keys/id_fanout} \
                 --store-path ${fanout.defaultPayload} \
                 "$@"

@@ -45,15 +45,24 @@ INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 OVERLAY_IMAGE_NAME = "overlay.img"
 # Bump when the capture procedure or state format changes so stale cached
 # snapshots are never restored into a mismatched launcher.
-SNAPSHOT_FORMAT = "mapped-ram-v1"
+SNAPSHOT_FORMAT = "shared-ram-v1"
 SNAPSHOT_CAPTURE_TIMEOUT_S = 180.0
 MIGRATION_POLL_S = 0.01
-# Settle guest writes and drop caches before capture. With init_on_free=1
-# (guest.nix) the freed pages are zero and mapped-ram leaves them out.
+# Settle guest writes and drop caches before capture, so the RAM image holds
+# no stale page cache (init_on_free=1 in guest.nix zeroes what is freed).
 GUEST_SNAPSHOT_PREP = (
     "sync && echo 3 > /proc/sys/vm/drop_caches && echo 1 > /proc/sys/vm/compact_memory"
 )
-MAPPED_RAM = {"capabilities": [{"capability": "mapped-ram", "state": True}]}
+# Guest RAM lives in a file-backed memory backend, so migration skips it
+# (x-ignore-shared) and the state file holds only device state and small
+# RAM blocks (mapped-ram).
+GUEST_RAM_ID = "fanout-ram"
+SNAPSHOT_CAPABILITIES = {
+    "capabilities": [
+        {"capability": "mapped-ram", "state": True},
+        {"capability": "x-ignore-shared", "state": True},
+    ]
+}
 
 
 
@@ -73,10 +82,29 @@ class PortReservation:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """A booted guest captured once per runner: RAM/device state + its disk."""
+    """A booted guest captured once per runner: its RAM, device state, and disk."""
 
+    ram: Path
+    ram_mib: int
     state: Path
     overlay: Path
+
+
+def guest_ram_args(ram: Path, ram_mib: int, *, share: bool) -> list[str]:
+    """QEMU arguments placing guest RAM in the file ram.
+
+    Capture maps it shared, so the running guest's memory is the snapshot
+    image. Restores map it private: pages are shared copy-on-write through the
+    host page cache, so a restore loads nothing and each VM owns only the pages
+    it writes.
+    """
+    return [
+        "-object",
+        f"memory-backend-file,id={GUEST_RAM_ID},size={ram_mib}M,"
+        f"mem-path={ram},share={'on' if share else 'off'}",
+        "-machine",
+        f"memory-backend={GUEST_RAM_ID}",
+    ]
 
 
 @dataclass
@@ -244,6 +272,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "(required with --boot snapshot)"
         ),
     )
+    parser.add_argument(
+        "--guest-mem-mib",
+        type=int,
+        help="guest RAM size the runner passes to -m (required with --boot snapshot)",
+    )
     args = parser.parse_args(argv)
 
     if not 2 <= args.count <= MAX_VM_COUNT:
@@ -275,6 +308,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error(f"--restore-runner does not resolve to an existing path: {error}")
         if not args.restore_runner.is_file() or not os.access(args.restore_runner, os.X_OK):
             parser.error(f"--restore-runner must be an executable file: {args.restore_runner}")
+        if args.guest_mem_mib is None or args.guest_mem_mib <= 0:
+            parser.error("--boot snapshot requires a positive --guest-mem-mib")
 
     try:
         args.ssh_key = args.ssh_key.resolve(strict=True)
@@ -346,13 +381,15 @@ def launch_vms(
     count: int,
     vms: list[VmProcess],
     snapshot: Snapshot | None = None,
+    extra_args: Sequence[str] = (),
 ) -> None:
     # A restore waits for its state via QMP (-incoming defer). Every restore
     # shares the captured disk; -snapshot sends this VM's writes to a
     # temporary overlay in its TMPDIR (the workdir), so the image stays pristine.
-    argv = [str(runner)]
+    argv = [str(runner), *extra_args]
     if snapshot is not None:
         argv += ["-snapshot", "-incoming", "defer"]
+        argv += guest_ram_args(snapshot.ram, snapshot.ram_mib, share=False)
     for index in range(1, count + 1):
         workdir = run_dir / f"vm{index}"
         workdir.mkdir(mode=0o700)
@@ -469,7 +506,7 @@ def bring_up_vm(
 
         if snapshot is not None:
             # The capture was taken paused, so the loaded VM stays paused until cont.
-            qmp.execute("migrate-set-capabilities", MAPPED_RAM, deadline)
+            qmp.execute("migrate-set-capabilities", SNAPSHOT_CAPABILITIES, deadline)
             qmp.execute("migrate-incoming", {"uri": f"file:{snapshot.state}"}, deadline)
             wait_for_migration(qmp, vm.index, deadline)
             qmp.execute("cont", None, deadline)
@@ -524,7 +561,12 @@ def snapshot_dir(cache: Path, runner: Path) -> Path:
     return cache / key
 
 
-def ensure_snapshot(runner: Path, ssh_key: Path, cache: Path) -> tuple[Snapshot, float | None]:
+def ensure_snapshot(
+    runner: Path,
+    ssh_key: Path,
+    cache: Path,
+    ram_mib: int,
+) -> tuple[Snapshot, float | None]:
     """Return the cached snapshot for runner, capturing it first on a miss.
 
     Capture is a per-image artifact, like building the runner: it happens
@@ -532,8 +574,13 @@ def ensure_snapshot(runner: Path, ssh_key: Path, cache: Path) -> tuple[Snapshot,
     Returns the capture duration, or None on a cache hit.
     """
     directory = snapshot_dir(cache, runner)
-    snapshot = Snapshot(state=directory / "state", overlay=directory / OVERLAY_IMAGE_NAME)
-    if snapshot.state.is_file() and snapshot.overlay.is_file():
+    snapshot = Snapshot(
+        ram=directory / "ram",
+        ram_mib=ram_mib,
+        state=directory / "state",
+        overlay=directory / OVERLAY_IMAGE_NAME,
+    )
+    if snapshot_complete(snapshot):
         return snapshot, None
 
     started = time.monotonic()
@@ -543,26 +590,31 @@ def ensure_snapshot(runner: Path, ssh_key: Path, cache: Path) -> tuple[Snapshot,
     except OSError as error:
         raise HarnessError(f"cannot create snapshot staging under {cache}: {error}") from error
     try:
-        capture_snapshot(runner, ssh_key, staging)
+        capture_snapshot(runner, ssh_key, staging, ram_mib)
         try:
             (staging / "vm1" / OVERLAY_IMAGE_NAME).rename(staging / OVERLAY_IMAGE_NAME)
             shutil.rmtree(staging / "vm1")
             staging.rename(directory)
         except OSError as error:
             # A concurrent launcher may have published the same snapshot first.
-            if not (snapshot.state.is_file() and snapshot.overlay.is_file()):
+            if not snapshot_complete(snapshot):
                 raise HarnessError(f"cannot publish snapshot {directory}: {error}") from error
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return snapshot, time.monotonic() - started
 
 
-def capture_snapshot(runner: Path, ssh_key: Path, staging: Path) -> None:
+def snapshot_complete(snapshot: Snapshot) -> bool:
+    return all(path.is_file() for path in (snapshot.ram, snapshot.state, snapshot.overlay))
+
+
+def capture_snapshot(runner: Path, ssh_key: Path, staging: Path, ram_mib: int) -> None:
     reservations = reserve_ports(1)
     vms: list[VmProcess] = []
     try:
         deadline = time.monotonic() + SNAPSHOT_CAPTURE_TIMEOUT_S
-        launch_vms(runner, staging, 1, vms)
+        ram_args = guest_ram_args(staging / "ram", ram_mib, share=True)
+        launch_vms(runner, staging, 1, vms, extra_args=ram_args)
         start_all_vms(vms, reservations, ssh_key, deadline, None)
         run_checked(
             "snapshot guest preparation",
@@ -574,7 +626,7 @@ def capture_snapshot(runner: Path, ssh_key: Path, staging: Path) -> None:
             qmp = QmpConnection(connection, vms[0].index)
             qmp.negotiate(deadline)
             qmp.execute("stop", None, deadline)
-            qmp.execute("migrate-set-capabilities", MAPPED_RAM, deadline)
+            qmp.execute("migrate-set-capabilities", SNAPSHOT_CAPABILITIES, deadline)
             qmp.execute("migrate", {"uri": f"file:{staging / 'state'}"}, deadline)
             wait_for_migration(qmp, vms[0].index, deadline)
         finally:
@@ -1051,7 +1103,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         if args.boot == "snapshot":
             # Before reserve_ports: capture boots one VM on VM 1's ports.
             snapshot, snapshot_capture_s = ensure_snapshot(
-                args.runner, ssh_key, args.snapshot_cache
+                args.runner, ssh_key, args.snapshot_cache, args.guest_mem_mib
             )
         reservations = reserve_ports(args.count)
         readiness_started = time.monotonic()
