@@ -104,6 +104,11 @@ in
       PermitRootLogin = "prohibit-password";
     };
   };
+  # Every readiness probe and relay hop is a root SSH login. Registering each
+  # with logind (session scope + cgroup setup and teardown) is guest CPU that
+  # 64 contending VMs pay on the critical path; the fleet has no interactive
+  # users. The openssh module enables it with a plain value, hence mkForce.
+  security.pam.services.sshd.startSession = lib.mkForce false;
   users.users.root.openssh.authorizedKeys.keyFiles = [ ./keys/id_fanout.pub ];
 
   # TEST-ONLY fixture credentials for guest-to-guest SSH through the QEMU
