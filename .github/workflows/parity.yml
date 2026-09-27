@@ -125,13 +125,28 @@ jobs:
             LogLevel ERROR
           EOF
           chmod 600 ~/.ssh/config
-          { printf 'export PATH="%s/consortium-tests/tests/bin:$PATH"\n' "$GITHUB_WORKSPACE"; cat ~/.bashrc; } > ~/.bashrc.new
+          # Gateways run `basename(sys.executable)` (`python`) in an SSH login
+          # shell. Upstream forwards only PYTHONPATH and CLUSTERSHELL_GW_* to
+          # them, so that shell must itself provide a working Rust backend: the
+          # venv's `python` (holding the extension) on PATH, and LIB_CLUSTERSHELL
+          # so the hybrid package can load its unported modules (including
+          # ClusterShell.Gateway) from the oracle lib. The hostname fixture stays
+          # first so it shadows the system hostname. Mirrors consortium#17.
+          {
+            printf 'export PATH="%s/consortium-tests/tests/bin:%s/consortium-tests/.venv/bin:$PATH"\n' "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE"
+            printf 'export LIB_CLUSTERSHELL="%s/consortium-tests/lib"\n' "$GITHUB_WORKSPACE"
+            cat ~/.bashrc
+          } > ~/.bashrc.new
           mv ~/.bashrc.new ~/.bashrc
 
           # Prove nested tree commands observe the simulated destination node.
           for node in 127.0.0.{2..7}; do
             test "$(ssh "$node" hostname -s)" = "$node"
           done
+          # Prove a gateway login shell can start the Rust-backend gateway module.
+          # ssh joins its arguments into one remote command line: quote it whole.
+          test "$(ssh 127.0.0.2 command -v python)" = "$GITHUB_WORKSPACE/consortium-tests/.venv/bin/python"
+          ssh 127.0.0.2 "python -c 'import ClusterShell._consortium, ClusterShell.Gateway'"
 
       # ── Python tests: original backend ─────────────────────────
       - name: Run Python tests (original backend)
