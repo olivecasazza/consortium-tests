@@ -106,9 +106,9 @@ jobs:
             python harness/cargo_to_junit.py > results/rust-unit.xml
 
       # ── Loopback SSH for ClusterShell tree tests ────────────────
-      # TreeWorker/GW tests ssh to localhost/127.0.0.1/127.0.0.2; the
-      # runner's sshd host keys must be in known_hosts and the extra
-      # loopback aliases must exist or every distant test fails.
+      # TreeWorker/GW tests ssh to localhost/127.0.0.1-7. The test
+      # hostname fixture derives a simulated node name from SSH_CONNECTION
+      # and must precede the system hostname on every nested SSH hop.
       - name: Prepare loopback SSH
         run: |
           sudo ip addr add 127.0.0.2/8 dev lo 2>/dev/null || true
@@ -118,13 +118,19 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan -t rsa,ecdsa,ed25519 localhost 127.0.0.1 127.0.0.2 >> ~/.ssh/known_hosts 2>/dev/null
           chmod 644 ~/.ssh/known_hosts
-          # Auto-accept host keys for all loopback aliases ClusterShell GW
-          # tests ssh to (127.0.0.1-127.0.0.9), independent of keyscan.
           cat > ~/.ssh/config <<'EOF'
           Host localhost 127.0.0.*
             StrictHostKeyChecking accept-new
+            LogLevel ERROR
           EOF
           chmod 600 ~/.ssh/config
+          { printf 'export PATH="%s/consortium-tests/tests/bin:$PATH"\n' "$GITHUB_WORKSPACE"; cat ~/.bashrc; } > ~/.bashrc.new
+          mv ~/.bashrc.new ~/.bashrc
+
+          # Prove nested tree commands observe the simulated destination node.
+          for node in 127.0.0.{2..7}; do
+            test "$(ssh "$node" hostname -s)" = "$node"
+          done
 
       # ── Python tests: original backend ─────────────────────────
       - name: Run Python tests (original backend)
