@@ -15,6 +15,6 @@ description = "Test infrastructure for consortium — ClusterShell parity suite 
 # Sibling-checkout layout: this repo expects the consortium repo checked out
 # at ../consortium (see README.md).
 [workspace.dependencies]
-consortium = { path = "../consortium/crates/consortium", package = "consortium-crate", version = "0.2.0" }
-consortium-nix = { path = "../consortium/crates/consortium-nix", version = "0.2.0" }
+consortium = { path = "../consortium/crates/consortium", package = "consortium-crate", version = "0.3.0" }
+consortium-nix = { path = "../consortium/crates/consortium-nix", version = "0.3.0" }
 consortium-test-harness = { path = "test-harness", version = "0.2.0" }
