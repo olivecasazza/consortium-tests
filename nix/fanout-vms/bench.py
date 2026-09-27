@@ -477,18 +477,34 @@ def bring_up_vm(
         connection.close()
 
 
-def bring_up_all_vms(
+def start_all_vms(
     vms: Sequence[VmProcess],
     reservations: Sequence[PortReservation],
+    ssh_key: Path,
     deadline: float,
     snapshot: Snapshot | None,
-) -> None:
+) -> float:
+    """Bring every VM up and wait until it serves SSH and HTTP.
+
+    Each VM polls readiness as soon as its own bring-up (and restore) ends, so
+    one slow QEMU start does not hold back the rest of the fleet. Returns the
+    latest bring-up completion, in seconds since the call.
+    """
+    started = time.monotonic()
+    bring_up_done: list[float] = []
+
+    def start(vm: VmProcess, reservation: PortReservation) -> None:
+        bring_up_vm(vm, reservation, deadline, snapshot)
+        bring_up_done.append(time.monotonic() - started)
+        wait_for_vm_ready(vm, ssh_key, deadline)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
         futures = [
-            executor.submit(bring_up_vm, vm, reservation, deadline, snapshot)
+            executor.submit(start, vm, reservation)
             for vm, reservation in zip(vms, reservations, strict=True)
         ]
-        collect_parallel_failures("QMP bring-up", futures)
+        collect_parallel_failures("fleet startup", futures)
+    return max(bring_up_done)
 
 
 def wait_for_migration(qmp: QmpConnection, vm_index: int, deadline: float) -> None:
@@ -547,8 +563,7 @@ def capture_snapshot(runner: Path, ssh_key: Path, staging: Path) -> None:
     try:
         deadline = time.monotonic() + SNAPSHOT_CAPTURE_TIMEOUT_S
         launch_vms(runner, staging, 1, vms)
-        bring_up_all_vms(vms, reservations, deadline, None)
-        wait_for_all_ready(vms, ssh_key, deadline)
+        start_all_vms(vms, reservations, ssh_key, deadline, None)
         run_checked(
             "snapshot guest preparation",
             host_ssh_command(ssh_key, vms[0].ssh_port, GUEST_SNAPSHOT_PREP),
@@ -667,16 +682,6 @@ def check_http_health(port: int, remaining: float) -> tuple[bool, str]:
     if body != b"ready\n":
         return False, f"expected b'ready\\n', got {body!r}"
     return True, "ready"
-
-
-def wait_for_all_ready(
-    vms: Sequence[VmProcess],
-    ssh_key: Path,
-    deadline: float,
-) -> None:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
-        futures = [executor.submit(wait_for_vm_ready, vm, ssh_key, deadline) for vm in vms]
-        collect_parallel_failures("fleet readiness", futures)
 
 
 def collect_parallel_failures(
@@ -1054,9 +1059,9 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         launch_vms(fleet_runner, run_dir, args.count, vms, snapshot)
         launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
-        bring_up_all_vms(vms, reservations, readiness_deadline, snapshot)
-        bring_up_s = time.monotonic() - readiness_started
-        wait_for_all_ready(vms, ssh_key, readiness_deadline)
+        bring_up_max_s = launch_s + start_all_vms(
+            vms, reservations, ssh_key, readiness_deadline, snapshot
+        )
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
 
@@ -1080,11 +1085,11 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
             ),
             "readiness_s": round(readiness_s, 6),
-            # Where readiness went: spawning every runner, then QMP bring-up of
-            # the whole fleet (forwards + restore); the rest is SSH/HTTP polling.
+            # Where readiness went: spawning every runner, then the slowest
+            # QMP bring-up (forwards + restore); the rest is SSH/HTTP polling.
             "readiness_phases_s": {
                 "launch": round(launch_s, 6),
-                "bring_up": round(bring_up_s, 6),
+                "bring_up_max": round(bring_up_max_s, 6),
             },
             "readiness_target_s": READINESS_TARGET_S,
             "ready_within_target": ready_within_target,
