@@ -10,7 +10,8 @@ a Rust reimplementation of the ClusterShell toolchain. This repo owns:
 - **Python oracle** — the vendored upstream implementation (`lib/ClusterShell/`),
   used as the reference backend and as the fallback for not-yet-ported modules.
 - **Comparison harness** (`harness/`) — sync, mapping, and scorecard tooling:
-  - `sync_upstream_tests.sh` — re-sync `tests/` + `lib/` from upstream and update `UPSTREAM_REF`
+  - `sync_upstream_tests.sh` — re-sync `tests/`, `lib/`, and
+    `bash_completion.d/` from upstream and update `UPSTREAM_REF`
   - `generate_test_mapping.py` — regenerate `TEST_MAPPING.toml` (Python test → Rust test)
   - `run_comparison.py` — run both pytest backends + Rust unit tests into JUnit XML
   - `render_summary.py` — render the migration scorecard from JUnit XML
@@ -25,10 +26,10 @@ a Rust reimplementation of the ClusterShell toolchain. This repo owns:
 ```
 tests/            upstream ClusterShell Python tests (+ tests/docker Docker assets)
 lib/              vendored upstream Python implementation (the oracle)
+bash_completion.d/ upstream clush/cluset completion scripts
 conf/             upstream ClusterShell configuration examples
 harness/          sync/mapping/comparison/scorecard scripts
-packaging/        upstream packaging files (rpm spec, bash completion)
-doc-legacy/       legacy upstream docs (was doc/legacy/ in the consortium repo)
+packaging/        upstream RPM packaging files
 test-harness/     consortium-test-harness crate (Docker mini-HPC harness)
 integration-tests/  consortium-integration-tests crate (docker_tests feature-gated)
 TEST_MAPPING.toml generated python-test → rust-test mapping
@@ -88,7 +89,8 @@ CONSORTIUM_REPO=../consortium .venv/bin/python harness/generate_test_mapping.py 
 # or: .venv/bin/python harness/generate_test_mapping.py --update --consortium-repo=../consortium
 ```
 
-**Sync upstream tests** (updates `tests/`, `lib/`, and `UPSTREAM_REF` here):
+**Sync upstream tests** (updates `tests/`, `lib/`, `bash_completion.d/`, and
+`UPSTREAM_REF` here):
 
 ```sh
 bash harness/sync_upstream_tests.sh            # pinned ref

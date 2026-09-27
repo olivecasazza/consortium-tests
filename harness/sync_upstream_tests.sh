@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# sync_upstream_tests.sh — fetch tests + lib from upstream ClusterShell at a pinned ref.
+# sync_upstream_tests.sh — fetch tests, library, and CLI completions from
+# upstream ClusterShell at a pinned ref.
 #
 # Usage:
 #   ./harness/sync_upstream_tests.sh              # uses ref from UPSTREAM_REF
@@ -49,6 +50,11 @@ rsync -a --delete \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     "$EXTRACTED_DIR/lib/ClusterShell/" "$REPO_ROOT/lib/ClusterShell/"
+
+# Sync bash_completion.d/ (exercised by CLICompletionTest.py).
+echo "==> Syncing bash_completion.d/"
+rsync -a --delete \
+    "$EXTRACTED_DIR/bash_completion.d/" "$REPO_ROOT/bash_completion.d/"
 
 # Update pinned ref
 echo "$REF" > "$REPO_ROOT/UPSTREAM_REF"
