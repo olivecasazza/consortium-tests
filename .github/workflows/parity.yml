@@ -89,7 +89,6 @@ jobs:
 
       # ── Rust unit tests ────────────────────────────────────────
       - name: Run Rust unit tests
-        continue-on-error: true
         env:
           CONSORTIUM_REPO: ../consortium
         run: |
@@ -106,9 +105,29 @@ jobs:
           cargo test --manifest-path ../consortium/Cargo.toml -p consortium-crate 2>&1 | \
             python harness/cargo_to_junit.py > results/rust-unit.xml
 
+      # ── Loopback SSH for ClusterShell tree tests ────────────────
+      # TreeWorker/GW tests ssh to localhost/127.0.0.1/127.0.0.2; the
+      # runner's sshd host keys must be in known_hosts and the extra
+      # loopback aliases must exist or every distant test fails.
+      - name: Prepare loopback SSH
+        run: |
+          sudo ip addr add 127.0.0.2/8 dev lo 2>/dev/null || true
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -t rsa,ecdsa,ed25519 localhost 127.0.0.1 127.0.0.2 >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 644 ~/.ssh/known_hosts
+          # Auto-accept host keys for all loopback aliases ClusterShell GW
+          # tests ssh to (127.0.0.1-127.0.0.9), independent of keyscan.
+          cat > ~/.ssh/config <<'EOF'
+          Host localhost 127.0.0.*
+            StrictHostKeyChecking accept-new
+          EOF
+          chmod 600 ~/.ssh/config
+
       # ── Python tests: original backend ─────────────────────────
       - name: Run Python tests (original backend)
-        continue-on-error: true
         env:
           CONSORTIUM_BACKEND: python
           PYTHONPATH: ${{ github.workspace }}/consortium-tests/lib
@@ -118,12 +137,10 @@ jobs:
           python -m pytest tests/ -v \
             --timeout=30 \
             --tb=short \
-            --junit-xml=results/python-original.xml \
-            || true
+            --junit-xml=results/python-original.xml
 
       # ── Python tests: Rust backend ─────────────────────────────
       - name: Run Python tests (Rust backend)
-        continue-on-error: true
         env:
           CONSORTIUM_BACKEND: rust
           LIB_CLUSTERSHELL: ${{ github.workspace }}/consortium-tests/lib
@@ -132,16 +149,17 @@ jobs:
           python -m pytest tests/ -v \
             --timeout=30 \
             --tb=short \
-            --junit-xml=results/python-rust.xml \
-            || true
+            --junit-xml=results/python-rust.xml
 
       # ── Generate scorecard ─────────────────────────────────────
       - name: Generate test mapping
+        if: always()
         env:
           CONSORTIUM_REPO: ../consortium
         run: python harness/generate_test_mapping.py --update
 
       - name: Render scorecard
+        if: always()
         run: python harness/render_summary.py --results-dir=results >> $GITHUB_STEP_SUMMARY
 
       # ── Upload artifacts ───────────────────────────────────────
@@ -204,7 +222,7 @@ jobs:
             --features docker-tests \
             --test docker_integration \
             -- --test-threads=1 \
-            -Z unstable-options --format json 2>&1 | tee results-integration.json || true
+            -Z unstable-options --format json 2>&1 | tee results-integration.json
 
       - name: Run integration tests (large cluster — 33 nodes)
         run: |
@@ -212,7 +230,7 @@ jobs:
             --features docker-tests \
             --test docker_integration \
             "test_scale" \
-            -- --test-threads=1 || true
+            -- --test-threads=1
 
       - name: Cleanup Docker containers
         if: always()
