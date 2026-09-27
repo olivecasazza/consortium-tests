@@ -106,9 +106,10 @@ jobs:
             python harness/cargo_to_junit.py > results/rust-unit.xml
 
       # ── Loopback SSH for ClusterShell tree tests ────────────────
-      # TreeWorker/GW tests ssh to localhost/127.0.0.1-7. The test
-      # hostname fixture derives a simulated node name from SSH_CONNECTION
-      # and must precede the system hostname on every nested SSH hop.
+      # TreeWorker/GW tests ssh to localhost/127.0.0.1-7, while CLIClush
+      # uses the runner's short hostname. The test hostname fixture derives a
+      # simulated node name from SSH_CONNECTION and must precede the system
+      # hostname on every nested SSH hop.
       - name: Prepare loopback SSH
         run: |
           sudo ip addr add 127.0.0.2/8 dev lo 2>/dev/null || true
@@ -119,7 +120,7 @@ jobs:
           ssh-keyscan -t rsa,ecdsa,ed25519 localhost 127.0.0.1 127.0.0.2 >> ~/.ssh/known_hosts 2>/dev/null
           chmod 644 ~/.ssh/known_hosts
           cat > ~/.ssh/config <<'EOF'
-          Host localhost 127.0.0.*
+          Host *
             StrictHostKeyChecking accept-new
             LogLevel ERROR
           EOF
@@ -141,18 +142,21 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -v \
+            --capture=no \
             --timeout=30 \
             --tb=short \
             --junit-xml=results/python-original.xml
 
       # ── Python tests: Rust backend ─────────────────────────────
       - name: Run Python tests (Rust backend)
+        if: ${{ !cancelled() }}
         env:
           CONSORTIUM_BACKEND: rust
           LIB_CLUSTERSHELL: ${{ github.workspace }}/consortium-tests/lib
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -v \
+            --capture=no \
             --timeout=30 \
             --tb=short \
             --junit-xml=results/python-rust.xml
