@@ -34,6 +34,11 @@ HOST_COPY_TIMEOUT_S = 600.0
 CASCADE_TIMEOUT_S = 900.0
 VERIFY_TIMEOUT_S = 30.0
 PEER_PROBE_TIMEOUT_S = 15.0
+# Per-attempt readiness probe limits. 64 concurrent SSH handshakes on a busy
+# host can take seconds; killing an attempt that is still progressing and
+# starting over livelocks the fleet. The startup deadline bounds the total.
+READY_PROBE_CONNECT_TIMEOUT_S = 5
+READY_PROBE_TIMEOUT_S = 10.0
 TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 # Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
@@ -567,7 +572,12 @@ def capture_snapshot(runner: Path, ssh_key: Path, staging: Path) -> None:
         raise HarnessError("snapshot capture cleanup failed: " + "; ".join(cleanup_errors))
 
 
-def host_ssh_command(ssh_key: Path, port: int, remote_command: str) -> list[str]:
+def host_ssh_command(
+    ssh_key: Path,
+    port: int,
+    remote_command: str,
+    connect_timeout_s: int = 1,
+) -> list[str]:
     return [
         "ssh",
         "-F",
@@ -577,7 +587,7 @@ def host_ssh_command(ssh_key: Path, port: int, remote_command: str) -> list[str]
         "-p",
         str(port),
         "-oBatchMode=yes",
-        "-oConnectTimeout=1",
+        f"-oConnectTimeout={connect_timeout_s}",
         "-oConnectionAttempts=1",
         "-oIdentitiesOnly=yes",
         "-oStrictHostKeyChecking=no",
@@ -611,12 +621,14 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
         if not ssh_ready:
             try:
                 result = subprocess.run(
-                    host_ssh_command(ssh_key, vm.ssh_port, "true"),
+                    host_ssh_command(
+                        ssh_key, vm.ssh_port, "true", READY_PROBE_CONNECT_TIMEOUT_S
+                    ),
                     check=False,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=min(1.5, remaining),
+                    timeout=min(READY_PROBE_TIMEOUT_S, remaining),
                 )
             except subprocess.TimeoutExpired:
                 last_ssh_error = "check timed out"
@@ -639,7 +651,7 @@ def check_http_health(port: int, remaining: float) -> tuple[bool, str]:
     connection = http.client.HTTPConnection(
         "127.0.0.1",
         port,
-        timeout=max(0.01, min(1.0, remaining)),
+        timeout=max(0.01, min(READY_PROBE_TIMEOUT_S, remaining)),
     )
     try:
         connection.request("GET", "/health")
@@ -1040,8 +1052,10 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         readiness_started = time.monotonic()
         fleet_runner = args.runner if snapshot is None else args.restore_runner
         launch_vms(fleet_runner, run_dir, args.count, vms, snapshot)
+        launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
         bring_up_all_vms(vms, reservations, readiness_deadline, snapshot)
+        bring_up_s = time.monotonic() - readiness_started
         wait_for_all_ready(vms, ssh_key, readiness_deadline)
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
@@ -1066,6 +1080,12 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
             ),
             "readiness_s": round(readiness_s, 6),
+            # Where readiness went: spawning every runner, then QMP bring-up of
+            # the whole fleet (forwards + restore); the rest is SSH/HTTP polling.
+            "readiness_phases_s": {
+                "launch": round(launch_s, 6),
+                "bring_up": round(bring_up_s, 6),
+            },
             "readiness_target_s": READINESS_TARGET_S,
             "ready_within_target": ready_within_target,
             "status": "ok" if ready_within_target else "performance_target_missed",
