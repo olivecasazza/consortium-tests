@@ -30,7 +30,9 @@ in
   microvm = {
     hypervisor = "qemu";
     vmHostPackages = vmHostPackages;
-    vcpu = 2;
+    # Restored guests never boot, so a second vCPU buys no boot parallelism;
+    # it only doubles the host threads 64 VMs contend for.
+    vcpu = 1;
     mem = 512;
 
     # The immutable guest closure is a disk, not a host-store share. Each
