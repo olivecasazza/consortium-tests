@@ -231,6 +231,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         / "fanout64-snapshots",
         help="directory holding captured snapshots, keyed by runner (default: %(default)s)",
     )
+    parser.add_argument(
+        "--restore-runner",
+        type=Path,
+        help=(
+            "runner for restored VMs: the --runner machine without a kernel to boot "
+            "(required with --boot snapshot)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not 2 <= args.count <= MAX_VM_COUNT:
@@ -252,6 +260,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"--runner does not resolve to an existing path: {error}")
     if not args.runner.is_file() or not os.access(args.runner, os.X_OK):
         parser.error(f"--runner must be an executable file: {args.runner}")
+
+    if args.boot == "snapshot":
+        if args.restore_runner is None:
+            parser.error("--boot snapshot requires --restore-runner")
+        try:
+            args.restore_runner = args.restore_runner.resolve(strict=True)
+        except OSError as error:
+            parser.error(f"--restore-runner does not resolve to an existing path: {error}")
+        if not args.restore_runner.is_file() or not os.access(args.restore_runner, os.X_OK):
+            parser.error(f"--restore-runner must be an executable file: {args.restore_runner}")
 
     try:
         args.ssh_key = args.ssh_key.resolve(strict=True)
@@ -1020,7 +1038,8 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             )
         reservations = reserve_ports(args.count)
         readiness_started = time.monotonic()
-        launch_vms(args.runner, run_dir, args.count, vms, snapshot)
+        fleet_runner = args.runner if snapshot is None else args.restore_runner
+        launch_vms(fleet_runner, run_dir, args.count, vms, snapshot)
         readiness_deadline = readiness_started + args.startup_deadline
         bring_up_all_vms(vms, reservations, readiness_deadline, snapshot)
         wait_for_all_ready(vms, ssh_key, readiness_deadline)
