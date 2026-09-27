@@ -19,9 +19,12 @@ RUN mkdir -p /etc/ssh /root/.ssh /run /var/empty && \
     printf 'Port 22\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nPubkeyAuthentication yes\nStrictModes no\n' > /etc/ssh/sshd_config && \
     ssh-keygen -A
 
-# Create a minimal flake for testing builds
+# Create a minimal, hermetic flake for testing builds. It has no inputs: an
+# unlocked `github:NixOS/nixpkgs` input made every test resolve the branch via
+# api.github.com (unauthenticated, rate-limited to HTTP 403 on shared CI
+# egress) and download all of nixpkgs just to write one file.
 RUN mkdir -p /test-flake && \
-    printf '{\n  description = "Test flake for consortium integration tests";\n  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";\n  outputs = { nixpkgs, ... }: let\n    pkgs = nixpkgs.legacyPackages.x86_64-linux;\n  in {\n    packages.x86_64-linux.hello = pkgs.hello;\n    packages.x86_64-linux.test-derivation = pkgs.writeText "test-output" "built-by-consortium";\n  };\n}\n' > /test-flake/flake.nix
+    printf '{\n  description = "Test flake for consortium integration tests";\n  outputs = { self }: {\n    packages.x86_64-linux.test-derivation = derivation {\n      name = "test-output";\n      system = "x86_64-linux";\n      builder = "/bin/sh";\n      args = [ "-c" "printf %%s built-by-consortium > $out" ];\n    };\n  };\n}\n' > /test-flake/flake.nix
 
 EXPOSE 22
 
