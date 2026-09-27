@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import http.client
 import json
 import os
@@ -35,6 +36,19 @@ VERIFY_TIMEOUT_S = 30.0
 PEER_PROBE_TIMEOUT_S = 15.0
 TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
+# Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
+OVERLAY_IMAGE_NAME = "overlay.img"
+# Bump when the capture procedure or state format changes so stale cached
+# snapshots are never restored into a mismatched launcher.
+SNAPSHOT_FORMAT = "mapped-ram-v1"
+SNAPSHOT_CAPTURE_TIMEOUT_S = 180.0
+MIGRATION_POLL_S = 0.01
+# Settle guest writes and drop caches before capture. With init_on_free=1
+# (guest.nix) the freed pages are zero and mapped-ram leaves them out.
+GUEST_SNAPSHOT_PREP = (
+    "sync && echo 3 > /proc/sys/vm/drop_caches && echo 1 > /proc/sys/vm/compact_memory"
+)
+MAPPED_RAM = {"capabilities": [{"capability": "mapped-ram", "state": True}]}
 
 
 
@@ -50,6 +64,14 @@ class PortReservation:
     def close(self) -> None:
         self.ssh.close()
         self.http.close()
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """A booted guest captured once per runner: RAM/device state + its disk."""
+
+    state: Path
+    overlay: Path
 
 
 @dataclass
@@ -84,7 +106,7 @@ class QmpConnection:
     def execute(
         self,
         command: str,
-        arguments: dict[str, str] | None,
+        arguments: dict[str, Any] | None,
         deadline: float,
     ) -> Any:
         request_id = self._next_id
@@ -193,6 +215,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "(default: bin/hello; its output must be exactly 'Hello, world!')"
         ),
     )
+    parser.add_argument(
+        "--boot",
+        choices=("snapshot", "cold"),
+        default="snapshot",
+        help=(
+            "snapshot (default): restore every VM from a booted guest captured once "
+            "per runner and cached; cold: boot every VM from the kernel"
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-cache",
+        type=Path,
+        default=Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        / "fanout64-snapshots",
+        help="directory holding captured snapshots, keyed by runner (default: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
     if not 2 <= args.count <= MAX_VM_COUNT:
@@ -284,7 +322,14 @@ def launch_vms(
     run_dir: Path,
     count: int,
     vms: list[VmProcess],
+    snapshot: Snapshot | None = None,
 ) -> None:
+    # A restore waits for its state via QMP (-incoming defer). Every restore
+    # shares the captured disk; -snapshot sends this VM's writes to a
+    # temporary overlay in its TMPDIR (the workdir), so the image stays pristine.
+    argv = [str(runner)]
+    if snapshot is not None:
+        argv += ["-snapshot", "-incoming", "defer"]
     for index in range(1, count + 1):
         workdir = run_dir / f"vm{index}"
         workdir.mkdir(mode=0o700)
@@ -294,6 +339,12 @@ def launch_vms(
                 f"QMP socket path is too long ({qmp_socket}); set TMPDIR to a shorter "
                 "caller-owned path"
             )
+
+        if snapshot is not None:
+            try:
+                (workdir / OVERLAY_IMAGE_NAME).symlink_to(snapshot.overlay)
+            except OSError as error:
+                raise HarnessError(f"VM {index}: cannot link snapshot disk: {error}") from error
 
         log_path = workdir / "runner.log"
         try:
@@ -305,7 +356,7 @@ def launch_vms(
         child_env["TMPDIR"] = str(workdir)
         try:
             process = subprocess.Popen(
-                [str(runner)],
+                argv,
                 cwd=workdir,
                 env=child_env,
                 stdin=subprocess.DEVNULL,
@@ -364,10 +415,11 @@ def connect_qmp(vm: VmProcess, deadline: float) -> socket.socket:
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
 
-def configure_forwarding(
+def bring_up_vm(
     vm: VmProcess,
     reservation: PortReservation,
     deadline: float,
+    snapshot: Snapshot | None,
 ) -> None:
     connection = connect_qmp(vm, deadline)
     try:
@@ -391,21 +443,110 @@ def configure_forwarding(
                 raise HarnessError(
                     f"VM {vm.index}: QMP command {command!r} returned an error: {result!r}"
                 )
+
+        if snapshot is not None:
+            # The capture was taken paused, so the loaded VM stays paused until cont.
+            qmp.execute("migrate-set-capabilities", MAPPED_RAM, deadline)
+            qmp.execute("migrate-incoming", {"uri": f"file:{snapshot.state}"}, deadline)
+            wait_for_migration(qmp, vm.index, deadline)
+            qmp.execute("cont", None, deadline)
     finally:
         connection.close()
 
 
-def configure_all_forwarding(
+def bring_up_all_vms(
     vms: Sequence[VmProcess],
     reservations: Sequence[PortReservation],
     deadline: float,
+    snapshot: Snapshot | None,
 ) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
         futures = [
-            executor.submit(configure_forwarding, vm, reservation, deadline)
+            executor.submit(bring_up_vm, vm, reservation, deadline, snapshot)
             for vm, reservation in zip(vms, reservations, strict=True)
         ]
-        collect_parallel_failures("QMP host forwarding", futures)
+        collect_parallel_failures("QMP bring-up", futures)
+
+
+def wait_for_migration(qmp: QmpConnection, vm_index: int, deadline: float) -> None:
+    while True:
+        status = qmp.execute("query-migrate", None, deadline).get("status")
+        if status == "completed":
+            return
+        if status in ("failed", "cancelled"):
+            raise HarnessError(f"VM {vm_index}: snapshot migration {status}")
+        time.sleep(MIGRATION_POLL_S)
+
+
+def snapshot_dir(cache: Path, runner: Path) -> Path:
+    # The runner is a Nix store path, so it pins the guest closure, kernel,
+    # QEMU binary, and device model that the captured state depends on.
+    key = hashlib.sha256(f"{SNAPSHOT_FORMAT}\0{runner}".encode()).hexdigest()[:32]
+    return cache / key
+
+
+def ensure_snapshot(runner: Path, ssh_key: Path, cache: Path) -> tuple[Snapshot, float | None]:
+    """Return the cached snapshot for runner, capturing it first on a miss.
+
+    Capture is a per-image artifact, like building the runner: it happens
+    before the fleet's readiness clock starts and is reported separately.
+    Returns the capture duration, or None on a cache hit.
+    """
+    directory = snapshot_dir(cache, runner)
+    snapshot = Snapshot(state=directory / "state", overlay=directory / OVERLAY_IMAGE_NAME)
+    if snapshot.state.is_file() and snapshot.overlay.is_file():
+        return snapshot, None
+
+    started = time.monotonic()
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="capture-", dir=cache))
+    except OSError as error:
+        raise HarnessError(f"cannot create snapshot staging under {cache}: {error}") from error
+    try:
+        capture_snapshot(runner, ssh_key, staging)
+        try:
+            (staging / "vm1" / OVERLAY_IMAGE_NAME).rename(staging / OVERLAY_IMAGE_NAME)
+            shutil.rmtree(staging / "vm1")
+            staging.rename(directory)
+        except OSError as error:
+            # A concurrent launcher may have published the same snapshot first.
+            if not (snapshot.state.is_file() and snapshot.overlay.is_file()):
+                raise HarnessError(f"cannot publish snapshot {directory}: {error}") from error
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return snapshot, time.monotonic() - started
+
+
+def capture_snapshot(runner: Path, ssh_key: Path, staging: Path) -> None:
+    reservations = reserve_ports(1)
+    vms: list[VmProcess] = []
+    try:
+        deadline = time.monotonic() + SNAPSHOT_CAPTURE_TIMEOUT_S
+        launch_vms(runner, staging, 1, vms)
+        bring_up_all_vms(vms, reservations, deadline, None)
+        wait_for_all_ready(vms, ssh_key, deadline)
+        run_checked(
+            "snapshot guest preparation",
+            host_ssh_command(ssh_key, vms[0].ssh_port, GUEST_SNAPSHOT_PREP),
+            timeout=VERIFY_TIMEOUT_S,
+        )
+        connection = connect_qmp(vms[0], deadline)
+        try:
+            qmp = QmpConnection(connection, vms[0].index)
+            qmp.negotiate(deadline)
+            qmp.execute("stop", None, deadline)
+            qmp.execute("migrate-set-capabilities", MAPPED_RAM, deadline)
+            qmp.execute("migrate", {"uri": f"file:{staging / 'state'}"}, deadline)
+            wait_for_migration(qmp, vms[0].index, deadline)
+        finally:
+            connection.close()
+    finally:
+        for reservation in reservations:
+            reservation.close()
+        cleanup_errors = terminate_vms(vms)
+    if cleanup_errors:
+        raise HarnessError("snapshot capture cleanup failed: " + "; ".join(cleanup_errors))
 
 
 def host_ssh_command(ssh_key: Path, port: int, remote_command: str) -> list[str]:
@@ -869,12 +1010,19 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
     result: dict[str, Any] | None = None
 
     try:
-        reservations = reserve_ports(args.count)
         ssh_key = copy_private_key(args.ssh_key, run_dir)
+        snapshot: Snapshot | None = None
+        snapshot_capture_s: float | None = None
+        if args.boot == "snapshot":
+            # Before reserve_ports: capture boots one VM on VM 1's ports.
+            snapshot, snapshot_capture_s = ensure_snapshot(
+                args.runner, ssh_key, args.snapshot_cache
+            )
+        reservations = reserve_ports(args.count)
         readiness_started = time.monotonic()
-        launch_vms(args.runner, run_dir, args.count, vms)
+        launch_vms(args.runner, run_dir, args.count, vms, snapshot)
         readiness_deadline = readiness_started + args.startup_deadline
-        configure_all_forwarding(vms, reservations, readiness_deadline)
+        bring_up_all_vms(vms, reservations, readiness_deadline, snapshot)
         wait_for_all_ready(vms, ssh_key, readiness_deadline)
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
@@ -890,10 +1038,14 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             args.binary_relative_path,
         )
         result = {
+            "boot": args.boot,
             "count": args.count,
             "deployment_s": round(deployment_s, 6),
             "host_arch": platform.machine(),
             "host_os": platform.system(),
+            "snapshot_capture_s": (
+                None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
+            ),
             "readiness_s": round(readiness_s, 6),
             "readiness_target_s": READINESS_TARGET_S,
             "ready_within_target": ready_within_target,

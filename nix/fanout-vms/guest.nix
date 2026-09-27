@@ -146,6 +146,12 @@ in
   boot.consoleLogLevel = 0;
   boot.initrd.verbose = false;
 
+  # The fleet restores from a snapshot captured after boot (bench.py). Zeroing
+  # pages on free means the pre-capture cache drop leaves zero pages, which
+  # mapped-ram migration omits: a smaller state file, and restored VMs only
+  # touch the pages that hold data.
+  boot.kernelParams = [ "init_on_free=1" ];
+
   systemd.services.fanout-health = {
     description = "Fanout microVM health endpoint";
     wantedBy = [ "multi-user.target" ];
