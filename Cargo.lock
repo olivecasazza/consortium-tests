@@ -16,13 +16,23 @@ checksum = "b46dec724fd22199ebde05033a0cbae453bc3b1ecff11eb6a6bb3eec4b90c6a4"
 
 [[package]]
 name = "consortium-crate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "configparser",
  "dirs-next",
  "hostname",
  "libc",
  "slotmap",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "consortium-integration"
+version = "0.3.0"
+dependencies = [
+ "consortium-crate",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -37,9 +47,10 @@ dependencies = [
 
 [[package]]
 name = "consortium-nix"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "consortium-crate",
+ "consortium-integration",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
