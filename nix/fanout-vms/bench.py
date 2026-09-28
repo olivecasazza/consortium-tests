@@ -578,10 +578,18 @@ def wait_for_migration(qmp: QmpConnection, vm_index: int, deadline: float) -> No
         time.sleep(MIGRATION_POLL_S)
 
 
-def snapshot_dir(cache: Path, runner: Path) -> Path:
+def snapshot_dir(cache: Path, runner: Path, ram_mib: int) -> Path:
     # The runner is a Nix store path, so it pins the guest closure, kernel,
-    # QEMU binary, and device model that the captured state depends on.
-    key = hashlib.sha256(f"{SNAPSHOT_FORMAT}\0{runner}".encode()).hexdigest()[:32]
+    # QEMU binary, and device model that the captured state depends on. The
+    # harness's own capture parameters pin the rest, and they have to be in
+    # the key: guest_ram_args tells QEMU to map ram_mib against the cached
+    # file, and the capture guest's readiness probe writes READY_PROBE_FILE
+    # into the golden overlay that every restore then shares. A cache hit
+    # under different values restores a state that was never captured.
+    material = "\0".join(
+        (SNAPSHOT_FORMAT, str(runner), str(ram_mib), READY_PROBE_FILE, GUEST_SNAPSHOT_PREP)
+    )
+    key = hashlib.sha256(material.encode()).hexdigest()[:32]
     return cache / key
 
 
@@ -597,7 +605,7 @@ def ensure_snapshot(
     before the fleet's readiness clock starts and is reported separately.
     Returns the capture duration, or None on a cache hit.
     """
-    directory = snapshot_dir(cache, runner)
+    directory = snapshot_dir(cache, runner, ram_mib)
     snapshot = Snapshot(
         ram=directory / "ram",
         ram_mib=ram_mib,

@@ -84,5 +84,40 @@ class PortReservationTest(unittest.TestCase):
             self.assertEqual(("127.0.0.1", port), reservation.getsockname())
 
 
+class SnapshotCacheKeyTest(unittest.TestCase):
+    """A cache hit must never restore a state captured under other parameters.
+
+    guest_ram_args maps ram_mib against the cached file, and the capture
+    guest's readiness probe writes READY_PROBE_FILE into the golden overlay
+    that every restore shares, so both belong in the cache key.
+    """
+
+    def setUp(self) -> None:
+        self.cache = Path("/tmp/fanout64-cache-key-test")
+        self.runner = Path("/nix/store/abc-microvm-run")
+
+    def test_same_parameters_reuse_one_directory(self) -> None:
+        first = bench.snapshot_dir(self.cache, self.runner, 512)
+        self.assertEqual(first, bench.snapshot_dir(self.cache, self.runner, 512))
+        self.assertEqual(self.cache, first.parent)
+
+    def test_a_different_ram_size_does_not_hit_the_cached_snapshot(self) -> None:
+        self.assertNotEqual(
+            bench.snapshot_dir(self.cache, self.runner, 512),
+            bench.snapshot_dir(self.cache, self.runner, 1024),
+        )
+
+    def test_a_different_runner_does_not_hit_the_cached_snapshot(self) -> None:
+        self.assertNotEqual(
+            bench.snapshot_dir(self.cache, self.runner, 512),
+            bench.snapshot_dir(self.cache, Path("/nix/store/xyz-microvm-run"), 512),
+        )
+
+    def test_a_different_probe_file_does_not_hit_the_cached_snapshot(self) -> None:
+        baseline = bench.snapshot_dir(self.cache, self.runner, 512)
+        with mock.patch.object(bench, "READY_PROBE_FILE", "/root/somewhere-else"):
+            self.assertNotEqual(baseline, bench.snapshot_dir(self.cache, self.runner, 512))
+
+
 if __name__ == "__main__":
     unittest.main()
