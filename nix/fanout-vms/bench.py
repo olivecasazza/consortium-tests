@@ -42,7 +42,12 @@ PEER_PROBE_TIMEOUT_S = 15.0
 READY_PROBE_CONNECT_TIMEOUT_S = 5
 READY_PROBE_TIMEOUT_S = 10.0
 # Readiness data exchange: write stdin to a guest file, sync it, read it back.
-READY_PROBE_FILE = "/root/fanout-ready-probe"
+# The file must live on the guest's block-backed writable store, not on the
+# initrd tmpfs that backs /. sync(2) on a tmpfs file is a no-op, so a probe
+# under /root would pass without the write ever reaching virtio-blk, the
+# qcow2 overlay, or the host. /nix/.rw-store is the ext4 volume from
+# microvm.volumes[]; assert_probe_file_is_durable keeps it that way.
+READY_PROBE_FILE = "/nix/.rw-store/fanout-ready-probe"
 READY_PROBE_EXCHANGE = (
     f"umask 077 && cat > {READY_PROBE_FILE} && sync {READY_PROBE_FILE} && cat {READY_PROBE_FILE}"
 )
@@ -818,6 +823,32 @@ def write_inventory(path: Path, count: int) -> str:
     return content
 
 
+def assert_probe_file_is_durable(vm: VmProcess, ssh_key: Path) -> None:
+    """Fail the run if the readiness sync can no-op on a RAM filesystem.
+
+    Checked once per run, on one VM and off the readiness clock: the probe's
+    value is that the write reached the block device, and a tmpfs probe path
+    would satisfy every other check while quietly proving nothing.
+    """
+    probe_directory = str(PurePosixPath(READY_PROBE_FILE).parent)
+    result = run_checked(
+        f"VM {vm.index} probe filesystem",
+        host_ssh_command(
+            ssh_key,
+            vm.ssh_port,
+            f"stat -f -c %T {shlex.quote(probe_directory)}",
+        ),
+        timeout=VERIFY_TIMEOUT_S,
+    )
+    filesystem = result.stdout.strip()
+    if not filesystem or "tmpfs" in filesystem:
+        raise HarnessError(
+            f"VM {vm.index}: readiness probe file {READY_PROBE_FILE} is on "
+            f"{filesystem or 'an unknown'} filesystem; sync would not reach the "
+ "block device, so the data exchange proves nothing"
+        )
+
+
 def prove_guest_gateway_relay(ssh_key: Path) -> None:
     peer_command = shlex.join(
         [
@@ -1195,6 +1226,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
 
+        assert_probe_file_is_durable(vms[0], ssh_key)
         prove_guest_gateway_relay(ssh_key)
         assert_store_path_absent(vms, ssh_key, args.store_path)
         inventory_content = write_inventory(run_dir / "inventory.toml", args.count)
