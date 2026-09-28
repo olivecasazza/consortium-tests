@@ -30,7 +30,7 @@ in
 {
   microvm = {
     hypervisor = "qemu";
-    vmHostPackages = vmHostPackages;
+    inherit vmHostPackages;
     # Restored guests never boot, so a second vCPU buys no boot parallelism;
     # it only doubles the host threads 64 VMs contend for.
     vcpu = 1;
