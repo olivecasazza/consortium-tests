@@ -70,6 +70,7 @@
                 --guest-mem-mib ${toString fanout.guestMemMiB} \
                 --ssh-key ${./nix/fanout-vms/keys/id_fanout} \
                 --store-path ${fanout.defaultPayload} \
+                --expect-stdout 'Hello, world!\n' \
                 "$@"
             '';
           };

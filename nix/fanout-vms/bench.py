@@ -263,9 +263,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--binary-relative-path",
         default="bin/hello",
+        help="executable path relative to the copied store path (default: bin/hello)",
+    )
+    parser.add_argument(
+        "--expect-stdout",
+        required=True,
         help=(
-            "executable path relative to the copied store path "
-            "(default: bin/hello; its output must be exactly 'Hello, world!')"
+            "exact stdout the deployed executable must produce; \\n is decoded to a "
+            "newline. Required: without it, payload verification degrades to an "
+            "exit-status check that still reports full marks"
         ),
     )
     parser.add_argument(
@@ -311,6 +317,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ):
         parser.error("--binary-relative-path must be a normalized relative guest path")
     args.binary_relative_path = binary_relative_path
+    args.expect_stdout = args.expect_stdout.replace("\\n", "\n")
 
     try:
         args.runner = args.runner.resolve(strict=True)
@@ -995,6 +1002,7 @@ def deploy_and_verify(
     store_path: Path,
     inventory_content: str,
     binary_relative_path: PurePosixPath,
+    expected_stdout: str,
 ) -> float:
     deployment_started = time.monotonic()
     encoded_key = urllib.parse.quote(str(ssh_key), safe="/")
@@ -1045,7 +1053,7 @@ def deploy_and_verify(
         timeout=CASCADE_TIMEOUT_S,
     )
 
-    verify_all_store_paths(vms, ssh_key, store_path, binary_relative_path)
+    verify_all_store_paths(vms, ssh_key, store_path, binary_relative_path, expected_stdout)
     return time.monotonic() - deployment_started
 
 
@@ -1054,6 +1062,7 @@ def verify_all_store_paths(
     ssh_key: Path,
     store_path: Path,
     binary_relative_path: PurePosixPath,
+    expected_stdout: str,
 ) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
         futures = [
@@ -1063,6 +1072,7 @@ def verify_all_store_paths(
                 ssh_key,
                 store_path,
                 binary_relative_path,
+                expected_stdout,
             )
             for vm in vms
         ]
@@ -1074,6 +1084,7 @@ def verify_store_path(
     ssh_key: Path,
     store_path: Path,
     binary_relative_path: PurePosixPath,
+    expected_stdout: str,
 ) -> None:
     result = run_checked(
         f"VM {vm.index} nix path-info",
@@ -1096,13 +1107,11 @@ def verify_store_path(
         host_ssh_command(ssh_key, vm.ssh_port, shlex.join([str(executable)])),
         timeout=VERIFY_TIMEOUT_S,
     )
-    if binary_relative_path == PurePosixPath("bin/hello"):
-        expected = "Hello, world!\n"
-        if execution.stdout != expected:
-            raise HarnessError(
-                f"VM {vm.index}: {executable} returned unexpected output; "
-                f"expected {expected!r}, got {execution.stdout!r}"
-            )
+    if execution.stdout != expected_stdout:
+        raise HarnessError(
+            f"VM {vm.index}: {executable} returned unexpected output; "
+            f"expected {expected_stdout!r}, got {execution.stdout!r}"
+        )
 
 
 def run_checked(
@@ -1281,6 +1290,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             args.store_path,
             inventory_content,
             args.binary_relative_path,
+            args.expect_stdout,
         )
         result = {
             "boot": args.boot,
@@ -1291,6 +1301,13 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             "snapshot_capture_s": (
                 None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
             ),
+            # What payload_executions_verified actually compared, so a reader
+            # of that count can tell a real output check from an exit status.
+            "payload": {
+                "binary_relative_path": str(args.binary_relative_path),
+                "expect_stdout": args.expect_stdout,
+                "store_path": str(args.store_path),
+            },
             "readiness_s": round(readiness_s, 6),
             # Both entries are durations, not offsets from the readiness clock:
             # spawning every runner, then the slowest QMP bring-up (forwards +
