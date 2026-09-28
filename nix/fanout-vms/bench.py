@@ -67,6 +67,11 @@ SCRATCH_PER_GUEST_MIB = 16
 SNAPSHOT_FORMAT = "shared-ram-v1"
 SNAPSHOT_CAPTURE_TIMEOUT_S = 180.0
 MIGRATION_POLL_S = 0.01
+# connect_qmp retries the QMP socket path while QEMU is still starting. Start
+# tight so a fast starter is picked up promptly, then back off to the old flat
+# step so a slow one is not polled hundreds of times.
+QMP_POLL_INITIAL_S = 0.001
+QMP_POLL_MAX_S = 0.02
 # Settle guest writes and drop caches before capture, so the RAM image holds
 # no stale page cache (init_on_free=1 in guest.nix zeroes what is freed).
 GUEST_SNAPSHOT_PREP = (
@@ -485,7 +490,15 @@ def launch_vms(
 
 
 def connect_qmp(vm: VmProcess, deadline: float) -> socket.socket:
+    # QEMU creates the QMP socket partway through its own startup, so every VM
+    # spends the first stretch of its bring-up retrying a path that does not
+    # exist yet. A flat 20 ms step meant each of the 64 VMs woke about 50 times
+    # a second for that, on a host that is already oversubscribed, and it also
+    # cost up to 20 ms of latency per VM at the moment the socket appeared.
+    # Backing off from a millisecond finds it sooner for a fast starter and
+    # costs a slow starter a fraction of the wakeups.
     last_error = "socket has not appeared"
+    delay = QMP_POLL_INITIAL_S
     while True:
         if vm.process.poll() is not None:
             raise HarnessError(
@@ -506,9 +519,9 @@ def connect_qmp(vm: VmProcess, deadline: float) -> socket.socket:
             connection.connect(str(vm.qmp_socket))
             return connection
         except OSError as error:
-            last_error = str(error)
             connection.close()
-            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 2, QMP_POLL_MAX_S)
 
 
 def bring_up_vm(

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -69,6 +70,54 @@ class PartialLaunchCleanupTest(unittest.TestCase):
             self.assertEqual([], cleanup_errors)
             self.assertIsNotNone(started_process.poll())
             self.assertFalse(bench.process_group_alive(started[0].process_group))
+
+
+class ConnectQmpBackoffTest(unittest.TestCase):
+    """The QMP socket poll must start tight and back off, not sit at one step.
+
+    Every one of 64 VMs retries a socket path that does not exist yet for the
+    first stretch of its bring-up. A flat step both wastes latency when the
+    socket appears between two attempts and keeps ~3200 wakeups a second
+    running on a host that is already oversubscribed by 64 QEMU processes.
+    """
+
+    def test_poll_backs_off_from_the_initial_step_to_the_cap(self) -> None:
+        sleeps: list[float] = []
+        attempts = {"n": 0}
+
+        def fake_connect(_self: socket.socket, address: str) -> None:
+            attempts["n"] += 1
+            if attempts["n"] <= 6:
+                raise FileNotFoundError(address)
+
+        vm = SimpleNamespace(
+            index=1,
+            qmp_socket=Path("/nonexistent/fanout.qmp"),
+            process=SimpleNamespace(poll=lambda: None),
+            workdir=Path("/nonexistent"),
+        )
+        with (
+            mock.patch.object(socket.socket, "connect", fake_connect),
+            mock.patch.object(bench.time, "sleep", sleeps.append),
+        ):
+            connection = bench.connect_qmp(vm, time.monotonic() + 30)  # type: ignore[arg-type]
+        connection.close()
+
+        self.assertEqual(6, len(sleeps))
+        self.assertEqual(
+            [
+                bench.QMP_POLL_INITIAL_S,
+                bench.QMP_POLL_INITIAL_S * 2,
+                bench.QMP_POLL_INITIAL_S * 4,
+                bench.QMP_POLL_INITIAL_S * 8,
+                bench.QMP_POLL_INITIAL_S * 16,
+                bench.QMP_POLL_MAX_S,
+            ],
+            sleeps,
+        )
+        # The old behaviour polled every 20 ms from the first attempt.
+        self.assertLess(sleeps[0], bench.QMP_POLL_MAX_S)
+        self.assertTrue(all(step <= bench.QMP_POLL_MAX_S for step in sleeps))
 
 
 class PortReservationTest(unittest.TestCase):
