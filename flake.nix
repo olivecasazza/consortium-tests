@@ -24,7 +24,6 @@
   outputs =
     inputs@{
       nixpkgs,
-      microvm-nix,
       consortium,
       ...
     }:
