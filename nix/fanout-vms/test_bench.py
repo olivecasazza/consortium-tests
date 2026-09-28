@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import socket
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 BENCH_PATH = Path(__file__).with_name("bench.py")
