@@ -131,7 +131,11 @@ class VmProcess:
     process: subprocess.Popen[bytes]
     process_group: int
     log: IO[bytes]
-
+    # The exact bytes this VM echoed back from READY_PROBE_FILE. Every
+    # restore shares one CoW-mapped RAM image and one read-only golden
+    # overlay, so a leak between VMs is the failure mode every restore
+    # optimization could introduce; the nonce is what makes it detectable.
+    probe_nonce: str | None = None
 
 class QmpConnection:
     """Minimal line-oriented QEMU Machine Protocol client."""
@@ -757,6 +761,7 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
                     )
                 else:
                     ssh_ready = True
+                    vm.probe_nonce = nonce
 
         remaining = deadline - time.monotonic()
         if not http_ready and remaining > 0:
@@ -847,6 +852,35 @@ def assert_probe_file_is_durable(vm: VmProcess, ssh_key: Path) -> None:
             f"{filesystem or 'an unknown'} filesystem; sync would not reach the "
  "block device, so the data exchange proves nothing"
         )
+
+
+def assert_fleet_state_is_independent(vms: Sequence[VmProcess], ssh_key: Path) -> None:
+    """Every VM must still hold exactly its own readiness nonce.
+
+    The 64 restores share one copy-on-write RAM image and one read-only
+    golden overlay, so every speedup in the restore path rests on VM i's
+    writes being invisible to VM j. Nothing else in the run would notice if
+    that stopped being true: each VM's own round trip still succeeds. Re-read
+    the probe file on every VM and require the unique bytes that VM wrote.
+    """
+    def check(vm: VmProcess) -> None:
+        if vm.probe_nonce is None:
+            raise HarnessError(f"VM {vm.index}: no readiness nonce was recorded")
+        result = run_checked(
+            f"VM {vm.index} probe file re-read",
+            host_ssh_command(ssh_key, vm.ssh_port, f"cat {READY_PROBE_FILE}"),
+            timeout=VERIFY_TIMEOUT_S,
+        )
+        if result.stdout != vm.probe_nonce:
+            raise HarnessError(
+                f"VM {vm.index}: restored guests are not independent; the readiness "
+                f"probe file holds {result.stdout!r} but this VM wrote "
+                f"{vm.probe_nonce!r}"
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
+        futures = [executor.submit(check, vm) for vm in vms]
+        collect_parallel_failures("fleet state independence", futures)
 
 
 def prove_guest_gateway_relay(ssh_key: Path) -> None:
@@ -1227,6 +1261,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         ready_within_target = readiness_s < READINESS_TARGET_S
 
         assert_probe_file_is_durable(vms[0], ssh_key)
+        assert_fleet_state_is_independent(vms, ssh_key)
         prove_guest_gateway_relay(ssh_key)
         assert_store_path_absent(vms, ssh_key, args.store_path)
         inventory_content = write_inventory(run_dir / "inventory.toml", args.count)
@@ -1266,6 +1301,8 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 "ssh_ready": args.count,
                 # Every VM passed an SSH write/read round trip of a unique nonce.
                 "ssh_data_exchange_verified": args.count,
+                # Every VM still held its own nonce after the whole fleet came up.
+                "state_isolation_verified": args.count,
                 "store_paths_verified": args.count,
             },
         }
