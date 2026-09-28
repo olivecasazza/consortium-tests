@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import hashlib
 import http.client
 import json
@@ -639,6 +640,16 @@ def capture_snapshot(runner: Path, ssh_key: Path, staging: Path, ram_mib: int) -
         raise HarnessError("snapshot capture cleanup failed: " + "; ".join(cleanup_errors))
 
 
+@functools.cache
+def host_ssh_binary() -> str:
+    # An absolute path lets subprocess take its posix_spawn path (see the
+    # readiness probe); a bare name makes it fork() and search PATH.
+    path = shutil.which("ssh")
+    if path is None:
+        raise HarnessError("ssh is not on PATH")
+    return path
+
+
 def host_ssh_command(
     ssh_key: Path,
     port: int,
@@ -646,7 +657,7 @@ def host_ssh_command(
     connect_timeout_s: int = 1,
 ) -> list[str]:
     return [
-        "ssh",
+        host_ssh_binary(),
         "-F",
         "/dev/null",
         "-i",
@@ -696,6 +707,15 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
                     capture_output=True,
                     text=True,
                     timeout=min(READY_PROBE_TIMEOUT_S, remaining),
+                    # Probes run while other VMs are still in bring-up. A
+                    # fork()ed child holds copies of every open fd until it
+                    # execs, including port reservations those VMs are about
+                    # to hand to QEMU, whose hostfwd bind then fails. With an
+                    # absolute executable and close_fds=False, subprocess uses
+                    # posix_spawn (macOS has no closefrom spawn action): no
+                    # forked copy, and ~3x cheaper for 64 concurrent probes.
+                    # The launcher's fds are non-inheritable (PEP 446).
+                    close_fds=False,
                 )
             except subprocess.TimeoutExpired:
                 last_ssh_error = "check timed out"
