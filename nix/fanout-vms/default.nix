@@ -20,13 +20,22 @@ let
   configuration = lib.nixosSystem {
     system = guestSystem;
     specialArgs = {
-      inherit consortiumCli vmHostPackages;
+      inherit consortiumCli vmHostPackages probe;
     };
     modules = [
       inputs.microvm-nix.nixosModules.microvm
       ./guest.nix
     ];
   };
+
+  # The readiness probe, as one binary instead of a cat/sync/cat pipeline: see
+  # probe.c for why the execs are on the critical path.
+  probe = guestPkgs.runCommandCC "fanout64-readiness-probe" { } ''
+    mkdir -p $out/bin
+    ${guestPkgs.stdenv.cc}/bin/cc \
+      -O2 -Wall -Wextra -Werror -std=c11 \
+      -o $out/bin/fanout-probe ${./probe.c}
+  '';
 
   # microvm-run execs QEMU with a fixed argument list. Forward extra arguments
   # so the launcher can capture and restore snapshots (-snapshot, -incoming);
@@ -52,6 +61,7 @@ let
 in
 {
   inherit configuration guestSystem runner;
+  probeBinary = "${probe}/bin/fanout-probe";
   guestMemMiB = configuration.config.microvm.mem;
   defaultPayload = guestPkgs.hello;
 }

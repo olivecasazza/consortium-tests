@@ -50,9 +50,11 @@ READY_PROBE_TIMEOUT_S = 10.0
 # qcow2 overlay, or the host. /nix/.rw-store is the ext4 volume from
 # microvm.volumes[]; assert_probe_file_is_durable keeps it that way.
 READY_PROBE_FILE = "/nix/.rw-store/fanout-ready-probe"
-READY_PROBE_EXCHANGE = (
-    f"umask 077 && cat > {READY_PROBE_FILE} && sync {READY_PROBE_FILE} && cat {READY_PROBE_FILE}"
-)
+# The remote command that performs the exchange is supplied by the caller
+# (--ready-probe-command), because the probe binary lives in the guest's store
+# closure and its path is a build output. The verification stays here and is
+# not negotiable: whatever the command is, its stdout must equal the nonce
+# byte for byte, so a wrong command fails loudly rather than passing quietly.
 TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 # Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
@@ -283,6 +285,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ready-probe-binary",
+        required=True,
+        help=(
+            "guest binary that performs the readiness data exchange: it must "
+            "read stdin, write it to " + READY_PROBE_FILE + ", fsync, and write "
+            "the bytes it reads back to stdout. Required, and the only part of "
+            "the probe the caller supplies, because it is a guest store path "
+            "that only the build knows. The file path and the comparison stay "
+            "here: stdout must equal the nonce byte for byte, so a wrong binary "
+            "fails loudly rather than passing quietly"
+        ),
+    )
+    parser.add_argument(
         "--boot",
         choices=("snapshot", "cold"),
         default="snapshot",
@@ -326,6 +341,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--binary-relative-path must be a normalized relative guest path")
     args.binary_relative_path = binary_relative_path
     args.expect_stdout = args.expect_stdout.replace("\\n", "\n")
+    args.ready_probe_command = f"{args.ready_probe_binary} {READY_PROBE_FILE}"
 
     try:
         args.runner = args.runner.resolve(strict=True)
@@ -569,6 +585,7 @@ def start_all_vms(
     ssh_key: Path,
     deadline: float,
     snapshot: Snapshot | None,
+    probe_command: str,
 ) -> float:
     """Bring every VM up and wait until it serves SSH and HTTP.
 
@@ -582,7 +599,7 @@ def start_all_vms(
     def start(vm: VmProcess, reservation: PortReservation) -> None:
         bring_up_vm(vm, reservation, deadline, snapshot)
         bring_up_done.append(time.monotonic() - started)
-        wait_for_vm_ready(vm, ssh_key, deadline)
+        wait_for_vm_ready(vm, ssh_key, deadline, probe_command)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
         futures = [
@@ -594,6 +611,16 @@ def start_all_vms(
 
 
 def wait_for_migration(qmp: QmpConnection, vm_index: int, deadline: float) -> None:
+    """Block until the migration finishes, by polling query-migrate.
+
+    QEMU's MIGRATION event would be the cheaper way to wait, and replacing this
+    poll with it was tried and reverted. Tracing the raw QMP socket on both
+    directions showed QEMU 11.1.1 delivering no MIGRATION event at all here: on
+    an outgoing `migrate` the connection received a STOP event and then nothing
+    while query-migrate reported completed, and on a restore the harness was
+    served a query-migrate reply. So there was no event to wait on, only a
+    deadline to block out.
+    """
     while True:
         status = qmp.execute("query-migrate", None, deadline).get("status")
         if status == "completed":
@@ -603,7 +630,9 @@ def wait_for_migration(qmp: QmpConnection, vm_index: int, deadline: float) -> No
         time.sleep(MIGRATION_POLL_S)
 
 
-def snapshot_dir(cache: Path, runner: Path, ram_mib: int) -> Path:
+def snapshot_dir(
+    cache: Path, runner: Path, ram_mib: int, probe_command: str
+) -> Path:
     # The runner is a Nix store path, so it pins the guest closure, kernel,
     # QEMU binary, and device model that the captured state depends on. The
     # harness's own capture parameters pin the rest, and they have to be in
@@ -611,8 +640,19 @@ def snapshot_dir(cache: Path, runner: Path, ram_mib: int) -> Path:
     # file, and the capture guest's readiness probe writes READY_PROBE_FILE
     # into the golden overlay that every restore then shares. A cache hit
     # under different values restores a state that was never captured.
+    #
+    # The probe command is in the key for the same reason: it names a guest
+    # store path, so swapping it for a different binary changes what the
+    # capture guest ran against that shared overlay.
     material = "\0".join(
-        (SNAPSHOT_FORMAT, str(runner), str(ram_mib), READY_PROBE_FILE, GUEST_SNAPSHOT_PREP)
+        (
+            SNAPSHOT_FORMAT,
+            str(runner),
+            str(ram_mib),
+            READY_PROBE_FILE,
+            probe_command,
+            GUEST_SNAPSHOT_PREP,
+        )
     )
     key = hashlib.sha256(material.encode()).hexdigest()[:32]
     return cache / key
@@ -623,6 +663,7 @@ def ensure_snapshot(
     ssh_key: Path,
     cache: Path,
     ram_mib: int,
+    probe_command: str,
 ) -> tuple[Snapshot, float | None]:
     """Return the cached snapshot for runner, capturing it first on a miss.
 
@@ -630,7 +671,7 @@ def ensure_snapshot(
     before the fleet's readiness clock starts and is reported separately.
     Returns the capture duration, or None on a cache hit.
     """
-    directory = snapshot_dir(cache, runner, ram_mib)
+    directory = snapshot_dir(cache, runner, ram_mib, probe_command)
     snapshot = Snapshot(
         ram=directory / "ram",
         ram_mib=ram_mib,
@@ -647,7 +688,7 @@ def ensure_snapshot(
     except OSError as error:
         raise HarnessError(f"cannot create snapshot staging under {cache}: {error}") from error
     try:
-        capture_snapshot(runner, ssh_key, staging, ram_mib)
+        capture_snapshot(runner, ssh_key, staging, ram_mib, probe_command)
         try:
             (staging / "vm1" / OVERLAY_IMAGE_NAME).rename(staging / OVERLAY_IMAGE_NAME)
             shutil.rmtree(staging / "vm1")
@@ -665,14 +706,20 @@ def snapshot_complete(snapshot: Snapshot) -> bool:
     return all(path.is_file() for path in (snapshot.ram, snapshot.state, snapshot.overlay))
 
 
-def capture_snapshot(runner: Path, ssh_key: Path, staging: Path, ram_mib: int) -> None:
+def capture_snapshot(
+    runner: Path,
+    ssh_key: Path,
+    staging: Path,
+    ram_mib: int,
+    probe_command: str,
+) -> None:
     reservations = reserve_ports(1)
     vms: list[VmProcess] = []
     try:
         deadline = time.monotonic() + SNAPSHOT_CAPTURE_TIMEOUT_S
         ram_args = guest_ram_args(staging / "ram", ram_mib, share=True)
         launch_vms(runner, staging, 1, vms, extra_args=ram_args)
-        start_all_vms(vms, reservations, ssh_key, deadline, None)
+        start_all_vms(vms, reservations, ssh_key, deadline, None, probe_command)
         run_checked(
             "snapshot guest preparation",
             host_ssh_command(ssh_key, vms[0].ssh_port, GUEST_SNAPSHOT_PREP),
@@ -732,7 +779,12 @@ def host_ssh_command(
     ]
 
 
-def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
+def wait_for_vm_ready(
+    vm: VmProcess,
+    ssh_key: Path,
+    deadline: float,
+    probe_command: str,
+) -> None:
     ssh_ready = False
     http_ready = False
     last_ssh_error = "not attempted"
@@ -763,7 +815,7 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
                     host_ssh_command(
                         ssh_key,
                         vm.ssh_port,
-                        READY_PROBE_EXCHANGE,
+                        probe_command,
                         READY_PROBE_CONNECT_TIMEOUT_S,
                     ),
                     check=False,
@@ -1320,7 +1372,11 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         if args.boot == "snapshot":
             # Before reserve_ports: capture boots one VM on VM 1's ports.
             snapshot, snapshot_capture_s = ensure_snapshot(
-                args.runner, ssh_key, args.snapshot_cache, args.guest_mem_mib
+                args.runner,
+                ssh_key,
+                args.snapshot_cache,
+                args.guest_mem_mib,
+                args.ready_probe_command,
             )
         reservations = reserve_ports(args.count)
         # The measured window writes the readiness probe and one nix copy, not
@@ -1337,7 +1393,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
         bring_up_max_s = start_all_vms(
-            vms, reservations, ssh_key, readiness_deadline, snapshot
+            vms, reservations, ssh_key, readiness_deadline, snapshot, args.ready_probe_command
         )
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S

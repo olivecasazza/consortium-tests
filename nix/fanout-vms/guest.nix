@@ -2,6 +2,7 @@
   lib,
   pkgs,
   consortiumCli,
+  probe,
   vmHostPackages,
   ...
 }:
@@ -167,6 +168,9 @@ in
       consortiumCli
       busyboxHttpd
       pkgs.openssh
+      # The readiness probe, replacing the cat/sync/cat pipeline: one exec
+      # instead of four per VM, and the probe tail is guest-vCPU bound.
+      probe
     ];
   };
   documentation.enable = false;

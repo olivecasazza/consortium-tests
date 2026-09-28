@@ -147,28 +147,31 @@ class SnapshotCacheKeyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.cache = Path("/tmp/fanout64-cache-key-test")
         self.runner = Path("/nix/store/abc-microvm-run")
+        self.probe = "/nix/store/xyz-fanout-probe/bin/fanout-probe /nix/.rw-store/p"
 
     def test_same_parameters_reuse_one_directory(self) -> None:
-        first = bench.snapshot_dir(self.cache, self.runner, 512)
-        self.assertEqual(first, bench.snapshot_dir(self.cache, self.runner, 512))
+        first = bench.snapshot_dir(self.cache, self.runner, 512, self.probe)
+        self.assertEqual(first, bench.snapshot_dir(self.cache, self.runner, 512, self.probe))
         self.assertEqual(self.cache, first.parent)
 
     def test_a_different_ram_size_does_not_hit_the_cached_snapshot(self) -> None:
         self.assertNotEqual(
-            bench.snapshot_dir(self.cache, self.runner, 512),
-            bench.snapshot_dir(self.cache, self.runner, 1024),
+            bench.snapshot_dir(self.cache, self.runner, 512, self.probe),
+            bench.snapshot_dir(self.cache, self.runner, 1024, self.probe),
         )
 
     def test_a_different_runner_does_not_hit_the_cached_snapshot(self) -> None:
         self.assertNotEqual(
-            bench.snapshot_dir(self.cache, self.runner, 512),
-            bench.snapshot_dir(self.cache, Path("/nix/store/xyz-microvm-run"), 512),
+            bench.snapshot_dir(self.cache, self.runner, 512, self.probe),
+            bench.snapshot_dir(self.cache, Path("/nix/store/xyz-microvm-run"), 512, self.probe),
         )
 
     def test_a_different_probe_file_does_not_hit_the_cached_snapshot(self) -> None:
-        baseline = bench.snapshot_dir(self.cache, self.runner, 512)
+        baseline = bench.snapshot_dir(self.cache, self.runner, 512, self.probe)
         with mock.patch.object(bench, "READY_PROBE_FILE", "/root/somewhere-else"):
-            self.assertNotEqual(baseline, bench.snapshot_dir(self.cache, self.runner, 512))
+            self.assertNotEqual(
+                baseline, bench.snapshot_dir(self.cache, self.runner, 512, self.probe)
+            )
 
 
 class VmScratchCapacityTest(unittest.TestCase):
@@ -273,6 +276,40 @@ class PayloadOutputVerificationTest(unittest.TestCase):
             self._verify("payload ok", "payload ok\n")
 
 
+def parse_harness_args(expect_stdout: str = "x") -> Any:
+    """Run the real argument parser over a valid minimal command line.
+
+    parse_args resolves --store-path strictly and requires it to be a direct
+    child of /nix/store, so borrow a real one rather than inventing a path.
+    """
+    store = Path("/nix/store")
+    if not store.is_dir():
+        raise unittest.SkipTest("no /nix/store on this host")
+    payload = next((entry for entry in sorted(store.iterdir()) if entry.is_dir()), None)
+    if payload is None:
+        raise unittest.SkipTest("/nix/store is empty on this host")
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        tmpdir = Path(temporary_directory)
+        runner = tmpdir / "runner"
+        runner.write_text("#!/bin/sh\n", encoding="utf-8")
+        runner.chmod(0o700)
+        key = tmpdir / "id"
+        key.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}):
+            return bench.parse_args(
+                [
+                    "--runner", str(runner),
+                    "--restore-runner", str(runner),
+                    "--guest-mem-mib", "512",
+                    "--ssh-key", str(key),
+                    "--store-path", str(payload),
+                    "--expect-stdout", expect_stdout,
+                    "--ready-probe-binary", "/nix/store/xyz-probe/bin/fanout-probe",
+                    "--count", "2",
+                ]
+            )
+
+
 class ExpectStdoutDecodingTest(unittest.TestCase):
     """--expect-stdout arrives as shell text; a literal backslash-n is a newline.
 
@@ -281,52 +318,55 @@ class ExpectStdoutDecodingTest(unittest.TestCase):
     Only the decode turns that into the newline the payload actually prints.
     """
 
-    def _parse(self, expect_stdout: str) -> Any:
-        # parse_args resolves --store-path strictly and requires it to be a
-        # direct child of /nix/store, so borrow a real one.
-        store = Path("/nix/store")
-        if not store.is_dir():
-            self.skipTest("no /nix/store on this host")
-        payload = next(
-            (entry for entry in sorted(store.iterdir()) if entry.is_dir()),
-            None,
-        )
-        if payload is None:
-            self.skipTest("/nix/store is empty on this host")
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            tmpdir = Path(temporary_directory)
-            runner = tmpdir / "runner"
-            runner.write_text("#!/bin/sh\n", encoding="utf-8")
-            runner.chmod(0o700)
-            key = tmpdir / "id"
-            key.write_text("", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}):
-                return bench.parse_args(
-                    [
-                        "--runner", str(runner),
-                        "--restore-runner", str(runner),
-                        "--guest-mem-mib", "512",
-                        "--ssh-key", str(key),
-                        "--store-path", str(payload),
-                        "--expect-stdout", expect_stdout,
-                        "--count", "2",
-                    ]
-                )
-
     def test_backslash_n_decodes_to_a_newline(self) -> None:
-        self.assertEqual("Hello, world!\n", self._parse("Hello, world!\\n").expect_stdout)
+        self.assertEqual("Hello, world!\n", parse_harness_args("Hello, world!\\n").expect_stdout)
 
     def test_a_doubled_backslash_is_not_collapsed(self) -> None:
         # Only a backslash-n pair is decoded. That is what makes the flake
         # wrapper's single backslash load-bearing: a wrapper that emitted
         # '\\n' would decode to a stray backslash and fail every payload check
         # with a one-byte diff.
-        self.assertEqual("a\\\\b\n", self._parse("a\\\\b\\n").expect_stdout)
+        self.assertEqual("a\\\\b\n", parse_harness_args("a\\\\b\\n").expect_stdout)
 
     def test_the_argument_is_required(self) -> None:
         with self.assertRaises(SystemExit), mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
             with mock.patch("sys.stderr"):
                 bench.parse_args(["--runner", "/bin/sh", "--count", "2"])
+
+
+class ReadyProbeCommandTest(unittest.TestCase):
+    """The caller supplies the binary; the harness owns the file and the check.
+
+    The probe path is a guest store path only the build knows, so it has to
+    come in as an argument. Everything that makes the probe meaningful stays
+    here: the file lives on the block-backed volume, and stdout is compared to
+    the nonce byte for byte.
+    """
+
+    def test_the_command_pairs_the_binary_with_the_harness_probe_file(self) -> None:
+        args = parse_harness_args()
+        self.assertEqual(
+            "/nix/store/xyz-probe/bin/fanout-probe " + bench.READY_PROBE_FILE,
+            args.ready_probe_command,
+        )
+
+    def test_a_different_probe_binary_does_not_hit_the_cached_snapshot(self) -> None:
+        cache, runner = Path("/tmp/fanout64-probe-key"), Path("/nix/store/abc-run")
+        self.assertNotEqual(
+            bench.snapshot_dir(cache, runner, 512, "/nix/store/one/probe /p"),
+            bench.snapshot_dir(cache, runner, 512, "/nix/store/two/probe /p"),
+        )
+
+    def test_moving_the_probe_file_off_tmpfs_invalidates_the_cached_snapshot(self) -> None:
+        # The probe file was once /root on the initrd tmpfs, where sync(2) is a
+        # no-op and the round trip proved nothing. If it ever moves back, the
+        # state captured against the durable path must not be reused.
+        cache, runner = Path("/tmp/fanout64-probe-path"), Path("/nix/store/abc-run")
+        durable = bench.snapshot_dir(cache, runner, 512, "/nix/store/p/probe /p")
+        with mock.patch.object(bench, "READY_PROBE_FILE", "/root/fanout-ready-probe"):
+            self.assertNotEqual(
+                durable, bench.snapshot_dir(cache, runner, 512, "/nix/store/p/probe /p")
+            )
 
 
 if __name__ == "__main__":
