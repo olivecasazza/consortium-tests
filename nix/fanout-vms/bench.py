@@ -44,6 +44,8 @@ TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 # Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
 OVERLAY_IMAGE_NAME = "overlay.img"
+# RAM-backed home for the fleet's -snapshot disk overlays (see create_vm_scratch).
+VM_SCRATCH_ROOT = Path("/dev/shm")
 # Bump when the capture procedure or state format changes so stale cached
 # snapshots are never restored into a mismatched launcher.
 SNAPSHOT_FORMAT = "shared-ram-v1"
@@ -383,6 +385,7 @@ def launch_vms(
     vms: list[VmProcess],
     snapshot: Snapshot | None = None,
     extra_args: Sequence[str] = (),
+    scratch: Path | None = None,
 ) -> None:
     # A restore waits for its state via QMP (-incoming defer). Every restore
     # shares the captured disk; -snapshot sends this VM's writes to a
@@ -413,8 +416,13 @@ def launch_vms(
         except OSError as error:
             raise HarnessError(f"VM {index}: cannot open log {log_path}: {error}") from error
 
+        # QEMU puts its -snapshot overlays (this VM's disk writes) in TMPDIR.
+        vm_tmpdir = workdir
+        if scratch is not None:
+            vm_tmpdir = scratch / f"vm{index}"
+            vm_tmpdir.mkdir(mode=0o700)
         child_env = os.environ.copy()
-        child_env["TMPDIR"] = str(workdir)
+        child_env["TMPDIR"] = str(vm_tmpdir)
         try:
             process = subprocess.Popen(
                 argv,
@@ -1110,11 +1118,41 @@ def remove_run_dir(run_dir: Path, tmpdir: Path) -> list[str]:
     return []
 
 
+def create_vm_scratch() -> Path | None:
+    """A RAM-backed directory for the fleet's -snapshot disk overlays, if any.
+
+    Each restore creates two temporary qcow2 overlays at startup; 128 of them
+    created at once on a disk filesystem serialize (on ext4, QMP readiness
+    went from 0.12 s to 0.45 s at 64 VMs). They only ever hold a disposable
+    VM's disk writes, so tmpfs is the natural home. Hosts without /dev/shm
+    (macOS) keep them in each VM's workdir.
+    """
+    if not VM_SCRATCH_ROOT.is_dir():
+        return None
+    try:
+        return Path(tempfile.mkdtemp(prefix="fv-scratch-", dir=VM_SCRATCH_ROOT))
+    except OSError as error:
+        raise HarnessError(f"cannot create VM scratch under {VM_SCRATCH_ROOT}: {error}") from error
+
+
+def remove_vm_scratch(scratch: Path | None) -> list[str]:
+    if scratch is None:
+        return []
+    try:
+        shutil.rmtree(scratch)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        return [f"failed to remove VM scratch {scratch}: {error}"]
+    return []
+
+
 def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     reservations: list[PortReservation] = []
     vms: list[VmProcess] = []
     failure: BaseException | None = None
     result: dict[str, Any] | None = None
+    scratch: Path | None = None
 
     try:
         ssh_key = copy_private_key(args.ssh_key, run_dir)
@@ -1126,9 +1164,10 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 args.runner, ssh_key, args.snapshot_cache, args.guest_mem_mib
             )
         reservations = reserve_ports(args.count)
+        scratch = create_vm_scratch()
         readiness_started = time.monotonic()
         fleet_runner = args.runner if snapshot is None else args.restore_runner
-        launch_vms(fleet_runner, run_dir, args.count, vms, snapshot)
+        launch_vms(fleet_runner, run_dir, args.count, vms, snapshot, scratch=scratch)
         launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
         bring_up_max_s = launch_s + start_all_vms(
@@ -1185,6 +1224,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         reservation.close()
     cleanup_errors.extend(terminate_vms(vms))
     cleanup_errors.extend(remove_run_dir(run_dir, args.tmpdir))
+    cleanup_errors.extend(remove_vm_scratch(scratch))
 
     if failure is not None:
         if cleanup_errors:
