@@ -92,8 +92,20 @@
           # port-reservation and cleanup logic is pure Python and must not
           # regress unnoticed — a TIME_WAIT regression once made a second
           # consecutive 64-node run fail to bind its HTTP host ports.
+          #
+          # openssh is not optional here: the tests build real ssh command
+          # lines, and host_ssh_command resolves the binary eagerly via
+          # shutil.which. Without it the sandbox raises "ssh is not on PATH"
+          # and three tests fail on the environment rather than on anything
+          # they assert.
           checks.fanout-bench-test =
-            pkgs.runCommand "consortium-fanout-bench-test" { nativeBuildInputs = [ python ]; }
+            pkgs.runCommand "consortium-fanout-bench-test"
+              {
+                nativeBuildInputs = [
+                  python
+                  pkgs.openssh
+                ];
+              }
               ''
                 export PYTHONDONTWRITEBYTECODE=1
                 cp -r ${./nix/fanout-vms} fanout-vms
