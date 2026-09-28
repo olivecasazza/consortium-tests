@@ -31,7 +31,9 @@ MAX_VM_COUNT = 64
 QMP_SOCKET_NAME = "fanout.qmp"
 # Darwin's sockaddr_un.sun_path is 104 bytes including the trailing NUL.
 MAX_QMP_SOCKET_PATH_BYTES = 103
-READINESS_TARGET_S = 10.0
+# The goal this fleet is measured against: 64 nodes ready on both platforms in
+# under 8 seconds. Do not loosen this to make a regression look like a pass.
+READINESS_TARGET_S = 8.0
 HOST_COPY_TIMEOUT_S = 600.0
 CASCADE_TIMEOUT_S = 900.0
 VERIFY_TIMEOUT_S = 30.0
@@ -255,7 +257,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="SECONDS",
         help=(
             "hard safety timeout for fleet startup (default: 120); "
-            "the separately reported performance target remains 10 seconds"
+            f"the separately reported performance target remains {READINESS_TARGET_S:g} seconds"
         ),
     )
     parser.add_argument(
@@ -1262,7 +1264,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         launch_vms(fleet_runner, run_dir, args.count, vms, snapshot, scratch=scratch)
         launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
-        bring_up_max_s = launch_s + start_all_vms(
+        bring_up_max_s = start_all_vms(
             vms, reservations, ssh_key, readiness_deadline, snapshot
         )
         readiness_s = time.monotonic() - readiness_started
@@ -1290,8 +1292,11 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
             ),
             "readiness_s": round(readiness_s, 6),
-            # Where readiness went: spawning every runner, then the slowest
-            # QMP bring-up (forwards + restore); the rest is SSH/HTTP polling.
+            # Both entries are durations, not offsets from the readiness clock:
+            # spawning every runner, then the slowest QMP bring-up (forwards +
+            # restore). The remainder, readiness_s - launch - bring_up_max, is
+            # SSH/HTTP polling. launch used to be added into bring_up_max,
+            # which double-counted the whole spawn phase against QMP bring-up.
             "readiness_phases_s": {
                 "launch": round(launch_s, 6),
                 "bring_up_max": round(bring_up_max_s, 6),
