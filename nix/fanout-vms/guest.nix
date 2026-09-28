@@ -69,6 +69,42 @@ in
     # harness tails runner.log on the host, not the guest console, so the
     # emulated 16550 is pure boot latency.
     qemu.serialConsole = false;
+
+    # 64 QEMU processes start inside the readiness window, and dynamic
+    # loading dominates each start: the stock build maps 67 Nix dylibs
+    # (spice, gstreamer, curl, iSCSI, smartcard, ...) none of which a
+    # headless slirp microVM uses. `minimal` would also drop libslirp, so
+    # switch features off individually.
+    qemu.package =
+      (vmHostPackages.qemu.override {
+        hostCpuOnly = true;
+        guestAgentSupport = false;
+        spiceSupport = false;
+        smartcardSupport = false;
+        vncSupport = false;
+        ncursesSupport = false;
+        libiscsiSupport = false;
+        capstoneSupport = false;
+        tpmSupport = false;
+        enableDocs = false;
+      }).overrideAttrs
+        (old: {
+          buildInputs = lib.filter (
+            input:
+            !lib.elem (lib.getName input) [
+              "curl"
+              "vde2"
+              "lzo"
+              "snappy"
+            ]
+          ) old.buildInputs;
+          configureFlags = old.configureFlags ++ [
+            "--disable-curl"
+            "--disable-vde"
+            "--disable-lzo"
+            "--disable-snappy"
+          ];
+        });
   };
 
   networking = {
