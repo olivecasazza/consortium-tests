@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import shlex
+import secrets
 import shutil
 import signal
 import socket
@@ -40,6 +41,11 @@ PEER_PROBE_TIMEOUT_S = 15.0
 # starting over livelocks the fleet. The startup deadline bounds the total.
 READY_PROBE_CONNECT_TIMEOUT_S = 5
 READY_PROBE_TIMEOUT_S = 10.0
+# Readiness data exchange: write stdin to a guest file, sync it, read it back.
+READY_PROBE_FILE = "/root/fanout-ready-probe"
+READY_PROBE_EXCHANGE = (
+    f"umask 077 && cat > {READY_PROBE_FILE} && sync {READY_PROBE_FILE} && cat {READY_PROBE_FILE}"
+)
 TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 # Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
@@ -705,13 +711,21 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
             )
 
         if not ssh_ready:
+            # SSH ping plus a data exchange: send a fresh nonce on stdin, have
+            # the guest write it to a file and read that file back. The VM is
+            # ready only if the exact bytes return, so a login that cannot
+            # move data or touch its filesystem does not count.
+            nonce = f"fanout-vm{vm.index}-{secrets.token_hex(16)}\n"
             try:
                 result = subprocess.run(
                     host_ssh_command(
-                        ssh_key, vm.ssh_port, "true", READY_PROBE_CONNECT_TIMEOUT_S
+                        ssh_key,
+                        vm.ssh_port,
+                        READY_PROBE_EXCHANGE,
+                        READY_PROBE_CONNECT_TIMEOUT_S,
                     ),
                     check=False,
-                    stdin=subprocess.DEVNULL,
+                    input=nonce,
                     capture_output=True,
                     text=True,
                     timeout=min(READY_PROBE_TIMEOUT_S, remaining),
@@ -730,9 +744,14 @@ def wait_for_vm_ready(vm: VmProcess, ssh_key: Path, deadline: float) -> None:
             except OSError as error:
                 last_ssh_error = str(error)
             else:
-                ssh_ready = result.returncode == 0
-                if not ssh_ready:
+                if result.returncode != 0:
                     last_ssh_error = summarize_output(result.stdout, result.stderr)
+                elif result.stdout != nonce:
+                    last_ssh_error = (
+                        f"data exchange mismatch: sent {nonce!r}, read back {result.stdout!r}"
+                    )
+                else:
+                    ssh_ready = True
 
         remaining = deadline - time.monotonic()
         if not http_ready and remaining > 0:
@@ -1213,6 +1232,8 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 "readiness_target": "ok" if ready_within_target else "missed",
                 "http_ready": args.count,
                 "ssh_ready": args.count,
+                # Every VM passed an SSH write/read round trip of a unique nonce.
+                "ssh_data_exchange_verified": args.count,
                 "store_paths_verified": args.count,
             },
         }
