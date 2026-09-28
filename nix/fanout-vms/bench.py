@@ -59,6 +59,9 @@ INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 OVERLAY_IMAGE_NAME = "overlay.img"
 # RAM-backed home for the fleet's -snapshot disk overlays (see create_vm_scratch).
 VM_SCRATCH_ROOT = Path("/dev/shm")
+# Per-guest RAM-scratch allowance for the qcow2 overlay itself, its ext4
+# metadata, and the readiness probe's write, on top of the payload size.
+SCRATCH_PER_GUEST_MIB = 16
 # Bump when the capture procedure or state format changes so stale cached
 # snapshots are never restored into a mismatched launcher.
 SNAPSHOT_FORMAT = "shared-ram-v1"
@@ -1221,7 +1224,25 @@ def remove_run_dir(run_dir: Path, tmpdir: Path) -> list[str]:
     return []
 
 
-def create_vm_scratch() -> Path | None:
+def store_path_bytes(path: Path) -> int:
+    """Bytes `nix copy` of this store path will write into one guest.
+
+    Symlinks are counted by lstat, so a payload that is mostly symlinks
+    undercounts. That is acceptable for a capacity guard with per-guest
+    headroom on top, and it never overcounts, so the check cannot be
+    satisfied by a payload that is actually too large.
+    """
+    total = 0
+    for root, _directories, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def create_vm_scratch(needed_bytes: int) -> Path | None:
     """A RAM-backed directory for the fleet's -snapshot disk overlays, if any.
 
     Each restore creates two temporary qcow2 overlays at startup; 128 of them
@@ -1229,8 +1250,30 @@ def create_vm_scratch() -> Path | None:
     went from 0.12 s to 0.45 s at 64 VMs). They only ever hold a disposable
     VM's disk writes, so tmpfs is the natural home. Hosts without /dev/shm
     (macOS) keep them in each VM's workdir.
+
+    Each overlay is a copy-on-write file over the guest's whole writable
+    volume, and everything `nix copy` writes during the measured deployment
+    phase lands in it, so the fleet can outgrow a small mount. Containers
+    commonly cap /dev/shm at 64 MiB. Checking here keeps that from surfacing as
+    an opaque nix copy I/O error inside deployment_s, which would silently turn
+    the number into a measurement of tmpfs headroom.
+
+    needed_bytes is what the measured window can actually write, not the
+    volume size: a guest that filled its whole 1 GiB volume would need 70 GiB
+    at 64 nodes, more than the 63 GiB /dev/shm on the Linux host, so budgeting
+    the maximum would decline the scratch everywhere and give back the 0.33 s
+    that placing the overlays on tmpfs won. A guest that overruns its budget
+    still fails, loudly, as a copy error.
     """
     if not VM_SCRATCH_ROOT.is_dir():
+        return None
+    try:
+        stat = os.statvfs(VM_SCRATCH_ROOT)
+    except OSError as error:
+        raise HarnessError(f"cannot stat {VM_SCRATCH_ROOT}: {error}") from error
+    available = stat.f_bavail * stat.f_frsize
+    if available < needed_bytes:
+        # Fall back to each VM's workdir rather than fail the guests later.
         return None
     try:
         return Path(tempfile.mkdtemp(prefix="fv-scratch-", dir=VM_SCRATCH_ROOT))
@@ -1267,7 +1310,14 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 args.runner, ssh_key, args.snapshot_cache, args.guest_mem_mib
             )
         reservations = reserve_ports(args.count)
-        scratch = create_vm_scratch()
+        # The measured window writes the readiness probe and one nix copy, not
+        # a full volume, so budget that rather than the volume size. See
+        # create_vm_scratch: budgeting the volume would need 70 GiB at 64
+        # nodes, more than the Linux host's 63 GiB /dev/shm.
+        scratch = create_vm_scratch(
+            args.count
+            * (store_path_bytes(args.store_path) * 2 + SCRATCH_PER_GUEST_MIB * 1024 * 1024)
+        )
         readiness_started = time.monotonic()
         fleet_runner = args.runner if snapshot is None else args.restore_runner
         launch_vms(fleet_runner, run_dir, args.count, vms, snapshot, scratch=scratch)
