@@ -25,12 +25,26 @@
       url = "git+https://github.com/olivecasazza/consortium?ref=feat/fanout-vm-harness&rev=850247da6ac4a09aa377fe96993126334304db34";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Claude Code plugin marketplace of hand-crafted agent skills, vendored at
+    # an exact rev: the catalog is part of the dev environment, so it has to be
+    # reproducible rather than "whatever main happens to be today". HTTPS, not
+    # SSH, for the same reason as `consortium` — Nix Checks runs on a
+    # GitHub-hosted runner that holds no key for this host. This repo has no
+    # flake.nix of its own, so the input contributes a source tree only and has
+    # no nixpkgs input to follow.
+    context-engineering-kit = {
+      url = "git+https://github.com/NeoLabHQ/context-engineering-kit?rev=23e2428e809d77717f8acc9659c374a3a1fcb93e";
+      # No flake.nix upstream: the catalog is consumed as a plain source tree.
+      flake = false;
+    };
+
   };
 
   outputs =
     inputs@{
       nixpkgs,
       consortium,
+      context-engineering-kit,
       ...
     }:
     let
@@ -45,6 +59,14 @@
         let
           pkgs = import nixpkgs { inherit system; };
           python = pkgs.python3;
+
+          # Interpreter for the dev shell: the parity suite's pytest
+          # dependencies, which the repo's broken `.venv` no longer provides.
+          pythonEnv = pkgs.python3.withPackages (ps: [
+            ps.pytest
+            ps.pytest-timeout
+            ps.pyyaml
+          ]);
 
           # The guest is aarch64-linux on an aarch64-darwin host (HVF) and
           # x86_64-linux otherwise. The CLI must match the GUEST system.
@@ -85,11 +107,36 @@
                 "$@"
             '';
           };
+          # Skill catalog harvested from the pinned context-engineering-kit.
+          # `$out` is a directory of skill directories whose names equal their
+          # SKILL.md `name:` frontmatter value (never the source directory
+          # name), each holding SKILL.md plus its `agents assets examples
+          # references scripts tests` resource dirs — the same layout
+          # consortium's `packages.skills` produces, so a consumer merging the
+          # two catalogs sees one shape. The `test -n` guard fails the build
+          # rather than silently shipping a skill under the literal name "".
+          skills = pkgs.runCommand "context-engineering-skills" { nativeBuildInputs = [ pkgs.findutils ]; } ''
+            mkdir -p $out
+            for skill_file in ${context-engineering-kit}/plugins/*/skills/*/SKILL.md; do
+              source_dir="$(dirname "$skill_file")"
+              skill_name="$(sed -n 's/^name:[[:space:]]*//p' "$skill_file" | head -n1)"
+              test -n "$skill_name"
+              destination="$out/$skill_name"
+              mkdir -p "$destination"
+              find "$source_dir" -maxdepth 1 -type f -exec cp {} "$destination/" \;
+              for resource in agents assets examples references scripts tests; do
+                if test -d "$source_dir/$resource"; then
+                  cp -rL "$source_dir/$resource" "$destination/$resource"
+                fi
+              done
+            done
+          '';
+
         in
         {
 
           packages = {
-            inherit fanout64;
+            inherit fanout64 skills;
             fanout64-guest = fanout.runner;
           };
 
@@ -124,6 +171,66 @@
                 python -m unittest discover -s fanout-vms -p 'test_*.py' -v
                 touch $out
               '';
+          devShells.default = pkgs.mkShell {
+            # The parity suite is pytest against the vendored oracle in `lib/`,
+            # and the integration layer is cargo against the sibling consortium
+            # checkout. This repo's own `.venv` is not usable as a baseline
+            # (it points at an interpreter that no longer exists), so the
+            # shellHook below puts a working interpreter on PATH.
+            packages = [
+              pkgs.cargo
+              pkgs.nix
+            ];
+
+            shellHook = ''
+              # The Python environment is put on PATH rather than passed in
+              # `packages`: a PythonEnvironment is a spliced package, and this
+              # nixpkgs' nativeBuildInputs dependency check rejects it outright
+              # ("Dependency is not of a valid type"). `inputsFrom` takes it
+              # but never puts its bin/ on PATH, so pytest stays unimportable.
+              export PATH="${pythonEnv}/bin:$PATH"
+
+              # The vendored catalog is consumed straight out of the store:
+              # every $out/<name> is symlinked into this repo's own agent skills
+              # directory, .agents/skills, which is where the committed
+              # upstream-sync-watch skill already lives — so an agent working
+              # here discovers them without a second, global catalog. Links,
+              # not copies: the pinned rev stays the single source of truth and
+              # re-entering the shell re-points them after a rebuild. A real
+              # directory squatting on a skill name is left alone, not clobbered.
+              if test -f "$PWD/pyproject.toml" && test -d "$PWD/tests"; then
+                skill_dir="$PWD/.agents/skills"
+                mkdir -p "$skill_dir"
+                linked=0
+                for skill in ${skills}/*; do
+                  test -d "$skill" || continue
+                  name="$(basename "$skill")"
+                  target="$skill_dir/$name"
+                  if test -L "$target"; then
+                    ln -sfn "$skill" "$target"
+                  elif test -e "$target"; then
+                    echo "  $name: $target exists and is not a symlink, left alone" >&2
+                    continue
+                  else
+                    ln -s "$skill" "$target"
+                  fi
+                  linked=$((linked + 1))
+                done
+
+                echo ""
+                echo "  consortium-tests dev shell"
+                echo "  ─────────────────────────────────────────"
+                echo "  $linked vendored skills linked into .agents/skills"
+                echo "  python -m pytest tests/  — upstream parity suite (oracle: PYTHONPATH=lib)"
+                echo "  cargo test -p consortium-integration-tests --features docker-tests"
+                echo "                            — Docker integration layer"
+                echo ""
+              else
+                echo "  nix develop: not in the consortium-tests checkout, skill links skipped" >&2
+              fi
+            '';
+          };
+
         };
 
       forEach = attr: lib.genAttrs supportedSystems (system: (perSystem system).${attr});
@@ -131,6 +238,7 @@
     {
       checks = forEach "checks";
       packages = forEach "packages";
+      devShells = forEach "devShells";
       apps = forEach "apps";
     };
 }
