@@ -18,13 +18,13 @@
         "rev": "850247da6ac4a09aa377fe96993126334304db34",
         "revCount": 1049,
         "type": "git",
-        "url": "ssh://git@github.com/olivecasazza/consortium"
+        "url": "https://github.com/olivecasazza/consortium"
       },
       "original": {
         "ref": "feat/fanout-vm-harness",
         "rev": "850247da6ac4a09aa377fe96993126334304db34",
         "type": "git",
-        "url": "ssh://git@github.com/olivecasazza/consortium"
+        "url": "https://github.com/olivecasazza/consortium"
       }
     },
     "crane": {

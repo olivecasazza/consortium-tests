@@ -19,7 +19,10 @@
     # relay sources are addressed as root@10.0.2.2:<port>, and without it
     # every guest-sourced hop fails (only seed -> 2 children land).
     consortium = {
-      url = "git+ssh://git@github.com/olivecasazza/consortium?ref=feat/fanout-vm-harness&rev=850247da6ac4a09aa377fe96993126334304db34";
+      # HTTPS, not SSH: Nix Checks runs on a GitHub-hosted runner that holds no
+      # key for this host, and the repo is public, so the fetch must not need
+      # one. The ref/rev pin is what matters; the transport is incidental.
+      url = "git+https://github.com/olivecasazza/consortium?ref=feat/fanout-vm-harness&rev=850247da6ac4a09aa377fe96993126334304db34";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
