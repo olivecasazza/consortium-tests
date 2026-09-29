@@ -72,6 +72,11 @@ SCRATCH_PER_GUEST_MIB = 16
 # snapshots are never restored into a mismatched launcher.
 SNAPSHOT_FORMAT = "shared-ram-v1"
 SNAPSHOT_CAPTURE_TIMEOUT_S = 180.0
+# Each distinct runner (any guest change) adds a ~565 MB snapshot directory
+# and nothing evicts it. Keep whatever has been used in this window; anything
+# older is a build that is no longer referenced and can only be recaptured.
+SNAPSHOT_RETENTION_DAYS = 7
+SNAPSHOT_RETENTION_S = SNAPSHOT_RETENTION_DAYS * 24 * 60 * 60
 MIGRATION_POLL_S = 0.01
 # connect_qmp retries the QMP socket path while QEMU is still starting. Start
 # tight so a fast starter is picked up promptly, then back off to the old flat
@@ -662,6 +667,38 @@ def snapshot_dir(
     return cache / key
 
 
+def touch_snapshot(directory: Path) -> None:
+    """Mark a snapshot as in use now, for prune_stale_snapshots."""
+    try:
+        directory.touch()
+    except OSError:
+        pass
+
+
+def prune_stale_snapshots(cache: Path, retention_s: float = SNAPSHOT_RETENTION_S) -> None:
+    """Remove cached snapshots not used within retention_s.
+
+    A snapshot is ~565 MB and every guest change produces a new runner, so the
+    cache grows without bound. Only whole key directories are considered, and
+    only those whose mtime is older than the window, so a directory another
+    launcher is using is left alone: a hit refreshes its mtime.
+    """
+    cutoff = time.time() - retention_s
+    try:
+        entries = list(cache.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.is_dir() or entry.name.startswith("capture-"):
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(entry)
+        except OSError:
+            continue
+
+
 def ensure_snapshot(
     runner: Path,
     ssh_key: Path,
@@ -683,6 +720,13 @@ def ensure_snapshot(
         overlay=directory / OVERLAY_IMAGE_NAME,
     )
     if snapshot_complete(snapshot):
+        # mtime is the only signal prune_stale_snapshots has that a directory
+        # is still in use, and reading a directory does not update it.
+        touch_snapshot(directory)
+        # Prune here as well as after a capture. Calling it only on the capture
+        # path means it never runs in steady state, where every run is a hit:
+        # measured, a nine-day-old entry survived a run that used the cache.
+        prune_stale_snapshots(cache)
         return snapshot, None
 
     started = time.monotonic()
@@ -703,6 +747,8 @@ def ensure_snapshot(
                 raise HarnessError(f"cannot publish snapshot {directory}: {error}") from error
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+    touch_snapshot(directory)
+    prune_stale_snapshots(cache)
     return snapshot, time.monotonic() - started
 
 

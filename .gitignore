@@ -27,3 +27,8 @@ tests/docker/docker-compose.generated.yml
 
 # Local secrets (GITHUB_TOKEN for upstream-sync-watch)
 .env.local
+
+# Skills vendored by the dev shell: symlinks into the pinned nix store, not
+# repo content. The committed upstream-sync-watch skill stays tracked.
+.agents/skills/*
+!.agents/skills/upstream-sync-watch
