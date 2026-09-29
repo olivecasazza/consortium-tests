@@ -4,7 +4,7 @@ from __future__ import annotations
 collect JUnit XML results for the scorecard.
 
 Usage:
-    python harness/run_comparison.py [--results-dir=./results] [--consortium-repo=../consortium]
+    python tools/run_comparison.py [--results-dir=./results] [--consortium-repo=../consortium]
 
 Produces:
     results/python-original.xml   — Python tests against pure-Python ClusterShell

@@ -4,7 +4,7 @@
 Reads from stdin, writes JUnit XML to stdout.
 
 Usage:
-    cargo test -p consortium-crate -- --format=terse 2>&1 | python harness/cargo_to_junit.py
+    cargo test -p consortium-crate -- --format=terse 2>&1 | python tools/cargo_to_junit.py
 """
 import sys
 import xml.etree.ElementTree as ET

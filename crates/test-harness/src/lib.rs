@@ -260,14 +260,15 @@ impl DockerCluster {
     fn docker_dir() -> PathBuf {
         // CARGO_MANIFEST_DIR is set to the *test* package's manifest dir when
         // cargo runs a test target. After the repo split, the consumer is
-        // consortium-tests/integration-tests, so the docker assets at
-        // consortium-tests/tests/docker are one level up.
+        // consortium-tests/crates/integration-tests, so the docker assets at
+        // consortium-tests/tests/docker are further up still. Walk up until we
+        // find them rather than counting parents, which breaks when crates move.
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(manifest)
-            .parent()
-            .unwrap()
-            .join("tests")
-            .join("docker")
+            .ancestors()
+            .find(|p| p.join("tests").join("docker").is_dir())
+            .map(|p| p.join("tests").join("docker"))
+            .expect("could not locate tests/docker above CARGO_MANIFEST_DIR")
     }
 
     fn generate_ssh_keys(docker_dir: &Path) -> Result<PathBuf, String> {

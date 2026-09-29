@@ -1,4 +1,6 @@
-include ChangeLog
+# ChangeLog was removed with doc-legacy/ on 2026-09-29: it was the vendored upstream
+# ClusterShell history, stale at v1.9.3, referenced by nothing. This line used
+# to point at a root ChangeLog that no longer existed.
 include README.md
 include COPYING.LGPLv2.1
 include bash_completion.d/*

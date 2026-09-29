@@ -9,16 +9,16 @@ a Rust reimplementation of the ClusterShell toolchain. This repo owns:
   (PyO3) bindings.
 - **Python oracle** — the vendored upstream implementation (`lib/ClusterShell/`),
   used as the reference backend and as the fallback for not-yet-ported modules.
-- **Comparison harness** (`harness/`) — sync, mapping, and scorecard tooling:
+- **Comparison harness** (`tools/`) — sync, mapping, and scorecard tooling:
   - `sync_upstream_tests.sh` — re-sync `tests/`, `lib/`, and
     `bash_completion.d/` from upstream and update `UPSTREAM_REF`
   - `generate_test_mapping.py` — regenerate `TEST_MAPPING.toml` (Python test → Rust test)
   - `run_comparison.py` — run both pytest backends + Rust unit tests into JUnit XML
   - `render_summary.py` — render the migration scorecard from JUnit XML
   - `cargo_to_junit.py` — convert `cargo test` output to JUnit XML
-- **Rust integration-test layer** — `test-harness/` (the
+- **Rust integration-test layer** — `crates/test-harness/` (the
   `consortium-test-harness` crate: DockerCompose mini-HPC clusters) and
-  `integration-tests/` (`docker_integration.rs` + `tool_integration.rs`,
+  `crates/integration-tests/` (`docker_integration.rs` + `tool_integration.rs`,
   gated behind the `docker-tests` feature). Docker assets live in `tests/docker/`.
 
 ## Layout
@@ -28,10 +28,10 @@ tests/            upstream ClusterShell Python tests (+ tests/docker Docker asse
 lib/              vendored upstream Python implementation (the oracle)
 bash_completion.d/ upstream clush/cluset completion scripts
 conf/             upstream ClusterShell configuration examples
-harness/          sync/mapping/comparison/scorecard scripts
+tools/            sync/mapping/comparison/scorecard scripts
 packaging/        upstream RPM packaging files
-test-harness/     consortium-test-harness crate (Docker mini-HPC harness)
-integration-tests/  consortium-integration-tests crate (docker_tests feature-gated)
+crates/test-harness/       consortium-test-harness crate (Docker mini-HPC harness)
+crates/integration-tests/  consortium-integration-tests crate (docker_tests feature-gated)
 TEST_MAPPING.toml generated python-test → rust-test mapping
 UPSTREAM_REF      pinned cea-hpc/clustershell ref for the parity suite
 setup.py, setup.cfg, MANIFEST.in, pyproject.toml, COPYING.LGPLv2.1
@@ -85,23 +85,23 @@ layout, or via the `LIB_CLUSTERSHELL` env var.)
 **Regenerate the test mapping** (scans Rust tests in the consortium repo):
 
 ```sh
-CONSORTIUM_REPO=../consortium .venv/bin/python harness/generate_test_mapping.py --update
-# or: .venv/bin/python harness/generate_test_mapping.py --update --consortium-repo=../consortium
+CONSORTIUM_REPO=../consortium .venv/bin/python tools/generate_test_mapping.py --update
+# or: .venv/bin/python tools/generate_test_mapping.py --update --consortium-repo=../consortium
 ```
 
 **Sync upstream tests** (updates `tests/`, `lib/`, `bash_completion.d/`, and
 `UPSTREAM_REF` here):
 
 ```sh
-bash harness/sync_upstream_tests.sh            # pinned ref
-bash harness/sync_upstream_tests.sh v1.10.1    # explicit ref
+bash tools/sync_upstream_tests.sh            # pinned ref
+bash tools/sync_upstream_tests.sh v1.10.1    # explicit ref
 ```
 
 **Full comparison + scorecard:**
 
 ```sh
-.venv/bin/python harness/run_comparison.py
-.venv/bin/python harness/render_summary.py --results-dir=results
+.venv/bin/python tools/run_comparison.py
+.venv/bin/python tools/render_summary.py --results-dir=results
 ```
 
 ## Docker integration tests
@@ -109,7 +109,7 @@ bash harness/sync_upstream_tests.sh v1.10.1    # explicit ref
 Requires Docker. SSH keys are generated automatically by the harness.
 
 ```sh
-cd integration-tests  # or run from repo root with -p
+cd crates/integration-tests  # or run from repo root with -p
 cargo test -p consortium-integration-tests --features docker-tests --test docker_integration -- --test-threads=1
 cargo test -p consortium-integration-tests --features docker-tests --test tool_integration -- --test-threads=1
 ```
