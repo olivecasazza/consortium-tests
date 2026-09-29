@@ -14,9 +14,38 @@ forwards applied over QMP at launch.
 |---|---|
 | Count | 2-64 (default 64), `--count N` |
 | Guest | 1 vCPU, 512 MiB, immutable erofs store + writable ext4 overlay |
-| Host systems | `x86_64-linux` (verified); `aarch64-darwin` evaluates but is unbuilt |
+| Host systems | `x86_64-linux` (KVM) and `aarch64-darwin` (HVF), both built and measured |
 | Readiness | SSH *and* HTTP `/health` answering on every node |
 | Payload | a store path copied host -> seed, then relayed log2-fanout to the rest |
+
+**What "ready" means.** Both checks, on every node, and a node that fails
+either is not counted:
+
+1. `GET /health` over the node's host forward must return status 200 with a
+   body of exactly `ready\n`.
+2. A full root SSH login must write a fresh random per-node nonce, `fsync`
+   it, and read the bytes back byte-for-byte. The probe is
+   `nix/fanout-vms/probe.c`, a single binary: the shell pipeline it replaced
+   (`umask 077 && cat > f && sync f && cat f`) cost three execs per node on
+   top of the login shell, 64 times at once, on the guest-vCPU-bound part of
+   the run.
+
+The nonce file is `/nix/.rw-store/fanout-ready-probe`, on the **block-backed
+ext4 volume**. It cannot move to the initrd tmpfs: `sync(2)` on tmpfs is a
+no-op, so the round trip would pass without the write ever reaching virtio-blk
+or the host. `assert_probe_file_is_durable` fails the run if that path is ever
+a RAM filesystem, because the failure it prevents is a green run that proves
+nothing.
+
+**Two required inputs** keep the verification from degrading silently:
+
+- `--expect-stdout` is the exact output the deployed payload must produce
+  (`\n` decodes to a newline). Without it the payload check was an exit-status
+  test that still reported `payload_executions_verified: 64`.
+- `--ready-probe-binary` is the guest store path of that probe binary. The
+  harness supplies the file path and the byte-for-byte comparison itself; only
+  the store path comes from the caller, so a wrong binary fails loudly rather
+  than passing quietly.
 
 ```bash
 # The cheap tests: launcher safety + the SSH-port parsing in the cascade.
@@ -33,8 +62,10 @@ ssh root@pdx-nxst-001.schrodinger.com "TMPDIR=/var/tmp $APP/bin/fanout64 --count
 ```
 
 Notes:
-- Run the VMs on a **Linux + KVM** host. The `aarch64-darwin` package
-  evaluates but has never been built or booted; treat it as unproven.
+- Both host systems are built and run: `x86_64-linux` on a 128-core KVM host
+  (pdx-nxst-001) and `aarch64-darwin` on Apple Silicon under HVF. Apple needs
+  the `aarch64-linux` guest closure cross-built, so it needs that builder
+  reachable; the Linux leg builds entirely on the target host.
 - The `| tail -1` matters: the flake devShell prints a banner, so the raw
   `--raw` output has trailing noise.
 - `--startup-deadline` (default 120 s) is a hard safety timeout, **not** the
@@ -45,22 +76,68 @@ Notes:
 - Ports are `22201`-`22264` (SSH) and `28201`-`28264` (HTTP). A collision
   names the exact port.
 
-**Measured results** on a 128-core / 125 GB Linux KVM host (pdx-nxst-001),
-guest configured 2 vCPU, no serial console, `console.enable = false`. Two
-boot modes; `--boot snapshot` is the default.
+**Where the benchmark driver lives.** The harness is here; the driver that
+runs it is `autoresearch-fanout64.sh` in the `nixos-config` repo, pinned to a
+commit of *this* repo. It stages a clean `git archive` of that commit and runs
+it — there is no overlay copy of the harness anywhere, and there should not be:
+harness changes belong in this repo.
+
+**Two pins in `flake.nix` that are not stylistic:**
+
+- `consortium` is pinned to `850247da` ("accept SSH ports in cascade source
+  addresses"), which is not on master. Relay sources are addressed as
+  `root@10.0.2.2:<port>`, and on master every guest-sourced hop fails, so only
+  seed -> 2 children land. The fleet still passes its per-node checks, which
+  is exactly why this is worth stating: a green run does not prove the relay
+  tree was used.
+- `consortium-cli` is built with `doCheck = false`. Its own suite passes in its
+  CI, but its `checkPhase` has a BrokenPipe race that fails guest builds
+  nondeterministically.
+
+**Measured results**, 64 nodes, on both host systems. `--boot snapshot` is the
+default and is what the table reports; `--boot cold` boots every guest from
+the kernel and is reported separately.
+
+| Host | Runs | Readiness (min / median / max) | Deployment (median) | 8 s target |
+|---|---|---|---|---|
+| `x86_64-linux` (KVM, 128 cores) | 30 | 0.418 / 0.466 / 0.973 s | 2.45 s | met |
+| `aarch64-darwin` (HVF) | 18 | 0.871 / 1.368 / 3.265 s | 3.02 s | met |
+
+Counted runs are only those reporting the full verification set
+(`ssh_data_exchange_verified`, `state_isolation_verified`,
+`payload_executions_verified` and `store_paths_verified` all at 64). That is a
+deliberately small sample: the isolation canary landed partway through, so runs
+before it cannot be counted as evidence of anything, and runs judged against
+the pre-8 s target bar are not mixed in.
+
+The Apple spread is the *host*, not the harness. The 18-core Mac that runs the
+aarch64 leg is shared, and its load average was observed ranging from 6.3 to
+135 over a single day, with readiness spread inside one 3-rep batch ranging
+from 0.42 s to 1.97 s at the high end. A quiet Apple host is the 0.87 s end of
+that column. The driver samples load before the fleet starts, prints it as
+`apple_ambient_load`, and warns above a ceiling precisely so a batch taken
+under load cannot be read as a harness result.
+
+The guest is `vcpu = 1`. The cold-boot figures further down were taken at
+`vcpu = 2` and are kept as history: that analysis is about the boot path, and
+the default path restores a snapshot instead of booting, where a second vCPU
+only doubled the host threads 64 VMs contend for. Those rows are not
+reproducible against today's guest.
+
+**Earlier measurements, kept as the record they are** — taken at `vcpu = 2`,
+before the probe binary and the isolation canary existed, in a quieter window
+than the table above:
 
 | Mode | Nodes | Readiness | Deployment | 8 s target |
 |---|---|---|---|---|
-| snapshot (default) | 2 | 0.235 s | 11.26 s (2-node cascade, cold cache) | met |
-| snapshot (default) | 64 | **0.44-0.50 s** | 2.37-2.40 s | met, ~16x headroom |
-| snapshot (default) | 64 | 0.68 s (host at load 104) | 2.49 s | met |
+| snapshot | 2 | 0.235 s | 11.26 s (2-node cascade, cold cache) | met |
+| snapshot | 64 | **0.44-0.50 s** | 2.37-2.40 s | met, ~16x headroom |
+| snapshot | 64 | 0.68 s (host at load 104) | 2.49 s | met |
 | `--boot cold` | 64 | 20.80 s / 27.74 s | 2.42 s | **missed** |
 
-Five consecutive 64-node snapshot runs: 0.505, 0.444, 0.446, 0.438, 0.681 s.
-The phase breakdown at 64 nodes is `launch 0.055 s` then `bring_up_max
-0.16 s`, reaching 0.44 s total. The last run was taken while an unrelated
-vLLM inference job held the host at load 104, so a quieter machine gives
-more headroom, not less.
+The phase breakdown at 64 nodes was `launch 0.055 s` then `bring_up_max
+0.16 s`. The 0.68 s run was taken while an unrelated vLLM inference job held
+the host at load 104, so a quieter machine gives more headroom, not less.
 
 **Capture is a one-time cost.** With an empty snapshot cache the run reports
 `snapshot_capture_s: 12.38` and lands at 0.42 s readiness once capture
