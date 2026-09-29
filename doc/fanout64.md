@@ -89,11 +89,25 @@ Notes:
 - Ports are `22201`-`22264` (SSH) and `28201`-`28264` (HTTP). A collision
   names the exact port.
 
-**Where the benchmark driver lives.** The harness is here; the driver that
-runs it is `autoresearch-fanout64.sh` in the `nixos-config` repo, pinned to a
-commit of *this* repo. It stages a clean `git archive` of that commit and runs
-it — there is no overlay copy of the harness anywhere, and there should not be:
-harness changes belong in this repo.
+**How to run it.** The driver is `nix/fanout-vms/run.sh`, in this repo beside
+the harness, and it archives a pinned commit of this repo into a scratch
+directory and runs that. Run it from a checkout:
+
+```sh
+nix/fanout-vms/run.sh                              # both platforms
+FANOUT_PLATFORMS=linux nix/fanout-vms/run.sh       # remote build, leaves the Mac idle
+FANOUT_REPS=6 nix/fanout-vms/run.sh                # more samples; the median of 3
+                                                   # cannot resolve a sub-second
+                                                   # change on a busy Apple host
+```
+
+`FANOUT_BASE_REPO` and `FANOUT_BASE_REV` point it at a different checkout or
+commit; the defaults are this checkout and `BASE_REV` below. The Apple leg
+needs the aarch64-linux builder, `nix/fanout-vms/linux-builder.nix`, which the
+driver names if it is not listening on `:31022`.
+
+There is no copy of the harness in any other repo, and there should not be:
+harness and driver both live here.
 
 **Two pins in `flake.nix` that are not stylistic:**
 
