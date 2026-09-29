@@ -45,19 +45,50 @@ Notes:
 - Ports are `22201`-`22264` (SSH) and `28201`-`28264` (HTTP). A collision
   names the exact port.
 
-**Measured results** on a 128-core / 125 GB Linux KVM host, with the
-optimized guest (2 vCPU, no serial console, `console.enable = false`):
+**Measured results** on a 128-core / 125 GB Linux KVM host (pdx-nxst-001),
+guest configured 2 vCPU, no serial console, `console.enable = false`. Two
+boot modes; `--boot snapshot` is the default.
 
-| Nodes | Baseline | Optimized | Deployment | 10 s target |
+| Mode | Nodes | Readiness | Deployment | 8 s target |
 |---|---|---|---|---|
-| 2 | 6.52 s | 4.78 s | 0.68 s | met |
-| 32 | 9.9-11.1 s | 7.97 s | 1.64 s | met |
-| 64 | 15.1-17.2 s | 13.2-14.0 s | 2.2-2.4 s | **missed** |
+| snapshot (default) | 2 | 0.235 s | 11.26 s (2-node cascade, cold cache) | met |
+| snapshot (default) | 64 | **0.44-0.50 s** | 2.37-2.40 s | met, ~16x headroom |
+| snapshot (default) | 64 | 0.68 s (host at load 104) | 2.49 s | met |
+| `--boot cold` | 64 | 20.80 s / 27.74 s | 2.42 s | **missed** |
+
+Five consecutive 64-node snapshot runs: 0.505, 0.444, 0.446, 0.438, 0.681 s.
+The phase breakdown at 64 nodes is `launch 0.055 s` then `bring_up_max
+0.16 s`, reaching 0.44 s total. The last run was taken while an unrelated
+vLLM inference job held the host at load 104, so a quieter machine gives
+more headroom, not less.
+
+**Capture is a one-time cost.** With an empty snapshot cache the run reports
+`snapshot_capture_s: 12.38` and lands at 0.42 s readiness once capture
+finishes. Subsequent runs read the cache under `~/.cache/fanout64-snapshots`
+and skip both the boot and the capture. First run end to end is therefore
+~12.8 s; every run after that is ~2.8 s including the full 64-node closure
+cascade.
 
 Readiness (launch until every node answers SSH and HTTP) and deployment
-(host -> seed copy, then log2 relay rounds, then verifying the payload executed
-on every node) are reported separately, because a fast payload distribution
-over a slow fleet boot is still a slow test.
+(host -> seed copy, then log2 relay rounds, then verifying the payload
+executed on every node) are reported separately, because a fast payload
+distribution over a slow fleet boot is still a slow test. Cold boot is
+40-60x slower than snapshot at 64 nodes, so the two modes are reported
+alongside each other rather than one replacing the other: the cold path is
+still what proves a guest boots from nothing.
+
+Every run also reports `state_isolation_verified` and
+`ssh_data_exchange_verified` at 64, so a green run means the restored
+guests are genuinely independent and exchanging real data - not merely that
+64 sockets accepted a connection.
+
+**Snapshot restore, not boot tuning, is what made this pass.** Everything below
+documents the cold-boot path: it is what produced the 20.8 s figure and the
+13-14 s figures quoted in the vCPU tables, all under `--boot cold`. With the
+default `--boot snapshot` those same 64 nodes come up in 0.44 s, so the boot
+tuning below moves a number that no longer gates the target. It is kept
+because the cold path still has to work, and because the measurements are
+what justify the guest config as it stands.
 
 **What the measurements ruled out.** The host is not the bottleneck: during a
 64-node boot it sits at 95.8% idle, load 18 of 128 cores, I/O wait 0.1%, no
