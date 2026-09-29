@@ -40,7 +40,7 @@ static int write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
-/* Second mode: emit N bytes of fresh kernel entropy on stdout.
+/* Second mode: emit N bytes of fresh kernel entropy on stdout, as hex.
  *
  * Every restore shares the captured RAM image, so the harness has to be able
  * to tell whether two nodes are drawing from independent RNG state or
@@ -75,7 +75,17 @@ static int emit_entropy(long want)
             close(fd);
             return -1;
         }
-        if (write_all(STDOUT_FILENO, buf, (size_t)got) != 0) {
+        /* Hex, not raw bytes: the harness reads this over SSH through a
+         * text-mode pipe, and raw entropy is not valid UTF-8. */
+        static const char digits[] = "0123456789abcdef";
+        char hex[sizeof(buf) * 2];
+        for (size_t i = 0; i < (size_t)got; i++) {
+            unsigned char byte = (unsigned char)buf[i];
+
+            hex[i * 2] = digits[byte >> 4];
+            hex[i * 2 + 1] = digits[byte & 0x0f];
+        }
+        if (write_all(STDOUT_FILENO, hex, (size_t)got * 2) != 0) {
             close(fd);
             return -1;
         }
@@ -122,7 +132,8 @@ int main(int argc, char **argv)
         long want = strtol(argv[2], &end, 10);
 
         if (!end || *end != '\0' || want <= 0 || want > 65536) {
-            fprintf(stderr, "usage: %s --entropy BYTES (1..65536)\n", argv[0]);
+            fprintf(stderr, "usage: %s --entropy BYTES (1..65536, hex on stdout)\n",
+                        argv[0]);
             return 2;
         }
         return emit_entropy(want) == 0 ? 0 : 1;

@@ -50,8 +50,10 @@ READY_PROBE_TIMEOUT_S = 10.0
 # qcow2 overlay, or the host. /nix/.rw-store is the ext4 volume from
 # microvm.volumes[]; assert_probe_file_is_durable keeps it that way.
 READY_PROBE_FILE = "/nix/.rw-store/fanout-ready-probe"
-# Bytes per node for the restored-guest entropy independence check.
+# Random bytes each node draws for the restored-guest entropy check. The
+# guest prints them hex-encoded, so 32 bytes arrive as 64 characters.
 ENTROPY_BYTES = 32
+ENTROPY_HEX_CHARS = ENTROPY_BYTES * 2
 # The remote command that performs the exchange is supplied by the caller
 # (--ready-probe-command), because the probe binary lives in the guest's store
 # closure and its path is a build output. The verification stays here and is
@@ -997,19 +999,22 @@ def assert_fleet_entropy_is_independent(
             ),
             timeout=VERIFY_TIMEOUT_S,
         )
-        return result.stdout.encode("utf-8", errors="surrogateescape")
+        return result.stdout
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         first, second = executor.map(draw, (vms[0], vms[1]))
-    if len(first) < ENTROPY_BYTES or len(second) < ENTROPY_BYTES:
-        raise HarnessError(
-            f"entropy draw too short: VM 1 returned {len(first)} bytes, "
-            f"VM 2 returned {len(second)} bytes, expected at least {ENTROPY_BYTES}"
-        )
+    for index, draw in ((1, first), (2, second)):
+        if len(draw) != ENTROPY_HEX_CHARS:
+            raise HarnessError(
+                f"VM {index}: entropy draw was {len(draw)} hex characters, "
+                f"expected {ENTROPY_HEX_CHARS} ({ENTROPY_BYTES} bytes)"
+            )
+        if any(character not in "0123456789abcdef" for character in draw):
+            raise HarnessError(f"VM {index}: entropy draw is not hex: {draw!r}")
     if first == second:
         raise HarnessError(
             "restored guests share one RNG stream: VM 1 and VM 2 produced "
-            f"identical {len(first)}-byte draws, so entropy is coming from the "
+            f"identical {ENTROPY_BYTES}-byte draws, so entropy is coming from the "
             "captured RAM image rather than the host"
         )
 

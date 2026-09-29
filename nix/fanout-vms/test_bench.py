@@ -378,9 +378,13 @@ class FleetEntropyIndependenceTest(unittest.TestCase):
     from shared state without any check failing.
     """
 
-    def _run(self, draws: list[bytes], expect_error: bool) -> None:
+    @staticmethod
+    def _hex(char: str) -> str:
+        return char * bench.ENTROPY_HEX_CHARS
+
+    def _run(self, draws: list[str], expect_error: bool) -> None:
         vms = [SimpleNamespace(index=i + 1, ssh_port=22200 + i) for i in range(2)]
-        completed = [subprocess.CompletedProcess([], 0, stdout=d.decode(), stderr="")
+        completed = [subprocess.CompletedProcess([], 0, stdout=d, stderr="")
                      for d in draws]
         with mock.patch.object(bench, "run_checked", side_effect=completed):
             if expect_error:
@@ -394,14 +398,19 @@ class FleetEntropyIndependenceTest(unittest.TestCase):
                 )
 
     def test_distinct_draws_pass(self) -> None:
-        self._run([b"a" * 32, b"b" * 32], expect_error=False)
+        self._run([self._hex("a"), self._hex("b")], expect_error=False)
 
     def test_identical_draws_fail(self) -> None:
         # The whole point: a shared stream must be caught, not tolerated.
-        self._run([b"c" * 32, b"c" * 32], expect_error=True)
+        self._run([self._hex("c"), self._hex("c")], expect_error=True)
+
+    def test_a_non_hex_draw_fails(self) -> None:
+        # The guest prints hex; anything else means the probe is not the one
+        # this harness was pointed at.
+        self._run([self._hex("a"), "z" * bench.ENTROPY_HEX_CHARS], expect_error=True)
 
     def test_a_short_draw_fails(self) -> None:
-        self._run([b"a" * 32, b"b"], expect_error=True)
+        self._run([self._hex("a"), "b" * 4], expect_error=True)
 
     def test_a_single_vm_is_refused(self) -> None:
         # Two nodes is the minimum that can distinguish a replayed stream.
@@ -416,7 +425,7 @@ class FleetEntropyIndependenceTest(unittest.TestCase):
 
         def record(description, command, timeout):
             seen.append(list(command))
-            return subprocess.CompletedProcess([], 0, stdout="x" * 32, stderr="")
+            return subprocess.CompletedProcess([], 0, stdout="a" * 64, stderr="")
 
         with mock.patch.object(bench, "run_checked", side_effect=record):
             with self.assertRaises(bench.HarnessError):  # identical stdout
