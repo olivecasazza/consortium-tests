@@ -20,6 +20,8 @@ a Rust reimplementation of the ClusterShell toolchain. This repo owns:
   `consortium-test-harness` crate: DockerCompose mini-HPC clusters) and
   `crates/integration-tests/` (`docker_integration.rs` + `tool_integration.rs`,
   gated behind the `docker-tests` feature). Docker assets live in `tests/docker/`.
+- **Audit backlog** — [`.specs/`](.specs/index.md): open issues found in this
+  repo and how work moves, with the checklist in `.specs/tasks/roadmap.md`.
 
 ## Layout
 
