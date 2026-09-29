@@ -3,9 +3,9 @@
 # upstream ClusterShell at a pinned ref.
 #
 # Usage:
-#   ./harness/sync_upstream_tests.sh              # uses ref from UPSTREAM_REF
-#   ./harness/sync_upstream_tests.sh v1.9.3       # explicit ref
-#   ./harness/sync_upstream_tests.sh HEAD          # latest master
+#   ./tools/sync_upstream_tests.sh              # uses ref from UPSTREAM_REF
+#   ./tools/sync_upstream_tests.sh v1.9.3       # explicit ref
+#   ./tools/sync_upstream_tests.sh HEAD          # latest master
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

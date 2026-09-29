@@ -4,7 +4,7 @@ from __future__ import annotations
 summary showing side-by-side migration progress.
 
 Usage:
-    python harness/render_summary.py [--results-dir=./results] [--mapping=TEST_MAPPING.toml]
+    python tools/render_summary.py [--results-dir=./results] [--mapping=TEST_MAPPING.toml]
 
 Reads:
     results/python-original.xml   — Python tests against pure-Python ClusterShell

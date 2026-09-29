@@ -205,7 +205,7 @@ rm -rf %{buildroot}
 %if 0%{?rhel}
 %defattr(-,root,root,-)
 %endif
-%doc ChangeLog README.md
+%doc README.md
 %if 0%{?suse_version} >= 1500
 %license COPYING.LGPLv2.1
 %else

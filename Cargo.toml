@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "test-harness",
-    "integration-tests",
+    "crates/test-harness",
+    "crates/integration-tests",
 ]
 
 [workspace.package]
@@ -17,4 +17,4 @@ description = "Test infrastructure for consortium — ClusterShell parity suite 
 [workspace.dependencies]
 consortium = { path = "../consortium/crates/consortium", package = "consortium-crate", version = "0.3.0" }
 consortium-nix = { path = "../consortium/crates/consortium-nix", version = "0.3.0" }
-consortium-test-harness = { path = "test-harness", version = "0.2.0" }
+consortium-test-harness = { path = "crates/test-harness", version = "0.2.0" }

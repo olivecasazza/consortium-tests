@@ -75,9 +75,9 @@ jobs:
         run: |
           REF="${{ github.event.inputs.upstream_ref }}"
           if [ -z "$REF" ]; then
-            bash harness/sync_upstream_tests.sh
+            bash tools/sync_upstream_tests.sh
           else
-            bash harness/sync_upstream_tests.sh "$REF"
+            bash tools/sync_upstream_tests.sh "$REF"
           fi
 
       # ── Build ──────────────────────────────────────────────────
@@ -103,7 +103,7 @@ jobs:
 
           # Generate JUnit XML from cargo test output
           cargo test --manifest-path ../consortium/Cargo.toml -p consortium-crate 2>&1 | \
-            python harness/cargo_to_junit.py > results/rust-unit.xml
+            python tools/cargo_to_junit.py > results/rust-unit.xml
 
       # ── Loopback SSH for ClusterShell tree tests ────────────────
       # TreeWorker/GW tests ssh to localhost/127.0.0.1-7, while CLIClush
@@ -181,11 +181,11 @@ jobs:
         if: always()
         env:
           CONSORTIUM_REPO: ../consortium
-        run: python harness/generate_test_mapping.py --update
+        run: python tools/generate_test_mapping.py --update
 
       - name: Render scorecard
         if: always()
-        run: python harness/render_summary.py --results-dir=results >> $GITHUB_STEP_SUMMARY
+        run: python tools/render_summary.py --results-dir=results >> $GITHUB_STEP_SUMMARY
 
       # ── Upload artifacts ───────────────────────────────────────
       - name: Upload test results

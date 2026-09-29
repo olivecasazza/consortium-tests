@@ -18,23 +18,28 @@ fn ssh_opts() -> &'static str {
     "-oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPasswordAuthentication=no -oConnectTimeout=10"
 }
 
-fn ssh_key() -> String {
-    // CARGO_MANIFEST_DIR = consortium-tests/integration-tests; the docker
-    // assets live at consortium-tests/tests/docker (one level up).
+fn repo_root() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR is the *test* package's manifest dir (consortium-tests/
+    // crates/integration-tests). The docker assets live at
+    // consortium-tests/tests/docker, so walk up until we find them rather than
+    // counting parents, which breaks whenever the crate moves.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let key = std::path::PathBuf::from(manifest)
-        .parent()
-        .unwrap()
-        .join("tests/docker/ssh/id_ed25519");
-    key.to_string_lossy().to_string()
+    std::path::PathBuf::from(manifest)
+        .ancestors()
+        .find(|p| p.join("tests/docker").is_dir())
+        .map(|p| p.to_path_buf())
+        .expect("could not locate repository root (no tests/docker above CARGO_MANIFEST_DIR)")
+}
+
+fn ssh_key() -> String {
+    repo_root()
+        .join("tests/docker/ssh/id_ed25519")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn docker_dir() -> std::path::PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(manifest)
-        .parent()
-        .unwrap()
-        .join("tests/docker")
+    repo_root().join("tests/docker")
 }
 
 /// Start a named container with the given image and port mapping.
