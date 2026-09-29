@@ -719,6 +719,10 @@ def ensure_snapshot(
         # mtime is the only signal prune_stale_snapshots has that a directory
         # is still in use, and reading a directory does not update it.
         touch_snapshot(directory)
+        # Prune here as well as after a capture. Calling it only on the capture
+        # path means it never runs in steady state, where every run is a hit:
+        # measured, a nine-day-old entry survived a run that used the cache.
+        prune_stale_snapshots(cache)
         return snapshot, None
 
     started = time.monotonic()

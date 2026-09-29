@@ -150,6 +150,30 @@ class SnapshotPruningTest(unittest.TestCase):
         bench.prune_stale_snapshots(self.cache)
         self.assertFalse(self.stale.exists())
 
+    def test_a_cache_hit_also_prunes(self) -> None:
+        # Pruning only after a capture never runs in steady state, where every
+        # run is a hit. Caught by running it: a nine-day-old entry survived a
+        # run that used the cache, and no test caught it, because the others
+        # called prune_stale_snapshots directly instead of going through
+        # ensure_snapshot.
+        runner = Path("/nix/store/abc-microvm-run")
+        probe = "/nix/store/xyz-probe/bin/fanout-probe " + bench.READY_PROBE_FILE
+        directory = bench.snapshot_dir(self.cache, runner, 512, probe)
+        shutil.copytree(self.used, directory)
+        for name in ("ram", "state", bench.OVERLAY_IMAGE_NAME):
+            (directory / name).write_bytes(b"x")
+        old = time.time() - 9 * 24 * 60 * 60
+        os.utime(self.stale, (old, old))
+        os.utime(directory, (time.time(), time.time()))
+
+        bench.ensure_snapshot(runner, Path("/dev/null"), self.cache, 512, probe)
+
+        self.assertFalse(
+            self.stale.exists(),
+            "a cache hit must prune too, or the cache never shrinks in steady state",
+        )
+        self.assertTrue(directory.is_dir())
+
     def test_pruning_leaves_a_capture_in_flight_alone(self) -> None:
         # A concurrent launcher's staging directory is named capture-* and is
         # not a published key; removing it would break that run mid-capture.
