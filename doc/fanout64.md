@@ -47,6 +47,19 @@ nothing.
   the store path comes from the caller, so a wrong binary fails loudly rather
   than passing quietly.
 
+Every run also proves two independence properties, because every restore maps
+the same captured RAM image copy-on-write and nothing else would notice if that
+stopped being true:
+
+- `state_isolation_verified` re-reads every node's probe file and requires the
+  unique bytes that node wrote, so VM i's writes must be invisible to VM j.
+- `entropy_isolation_verified` draws from `/dev/urandom` on two nodes and
+  requires them to differ. The write canary cannot see this: a shared entropy
+  stream is not a cross-node write leak, so every other check would stay green
+  while two nodes drew identical bytes. virtio-rng pulls from the host, so
+  restored nodes should differ -- and a fleet test that generated keys or
+  tokens per node would otherwise be drawing from captured state.
+
 ```bash
 # The cheap tests: launcher safety + the SSH-port parsing in the cascade.
 nix develop --command python3 -m unittest discover -s nix/fanout-vms -p 'test_*.py' -v
