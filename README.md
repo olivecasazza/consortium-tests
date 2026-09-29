@@ -38,6 +38,9 @@ setup.py, setup.cfg, MANIFEST.in, pyproject.toml, COPYING.LGPLv2.1
                   upstream Python packaging/pytest config kept with the suite
 ```
 
+Why each directory is where it is — including which ones are frozen because
+they are mirrored from upstream — is in [doc/structure/](doc/structure/index.md).
+
 ## Sibling-checkout requirement
 
 The Rust path dependencies and harness scripts expect the **consortium** repo
