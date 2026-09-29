@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -118,6 +119,72 @@ class ConnectQmpBackoffTest(unittest.TestCase):
         # The old behaviour polled every 20 ms from the first attempt.
         self.assertLess(sleeps[0], bench.QMP_POLL_MAX_S)
         self.assertTrue(all(step <= bench.QMP_POLL_MAX_S for step in sleeps))
+
+
+class SnapshotPruningTest(unittest.TestCase):
+    """The cache grows ~565 MB per guest build; only unused entries may go.
+
+    A hit refreshes its directory's mtime, and that is the sole signal pruning
+    has, so the two must be tested together: without the touch, pruning would
+    delete the snapshot the next run is about to use.
+    """
+
+    def setUp(self) -> None:
+        self.cache = Path(tempfile.mkdtemp(prefix="fanout64-prune-test-"))
+        self.addCleanup(shutil.rmtree, self.cache, ignore_errors=True)
+        self.used = self.cache / "used"
+        self.stale = self.cache / "stale"
+        for entry in (self.used, self.stale):
+            entry.mkdir()
+            (entry / "ram").write_bytes(b"x")
+        # used: touched now. stale: a week and a half ago.
+        old = time.time() - 8 * 24 * 60 * 60
+        os.utime(self.stale, (old, old))
+
+    def test_a_recently_used_snapshot_survives_pruning(self) -> None:
+        bench.touch_snapshot(self.used)
+        bench.prune_stale_snapshots(self.cache)
+        self.assertTrue(self.used.is_dir())
+
+    def test_an_unused_snapshot_older_than_the_window_is_removed(self) -> None:
+        bench.prune_stale_snapshots(self.cache)
+        self.assertFalse(self.stale.exists())
+
+    def test_pruning_leaves_a_capture_in_flight_alone(self) -> None:
+        # A concurrent launcher's staging directory is named capture-* and is
+        # not a published key; removing it would break that run mid-capture.
+        staging = self.cache / "capture-abc123"
+        staging.mkdir()
+        os.utime(staging, (0, 0))
+        bench.prune_stale_snapshots(self.cache)
+        self.assertTrue(staging.is_dir())
+
+    def test_a_cache_hit_refreshes_the_mtime_pruning_reads(self) -> None:
+        # The end-to-end contract, through ensure_snapshot rather than the
+        # helper: an old-but-valid snapshot is used, and using it is the only
+        # thing that saves it from the next prune. Calling touch_snapshot
+        # directly would pass even if the hit path stopped calling it.
+        runner = Path("/nix/store/abc-microvm-run")
+        probe = "/nix/store/xyz-probe/bin/fanout-probe " + bench.READY_PROBE_FILE
+        directory = bench.snapshot_dir(self.cache, runner, 512, probe)
+        shutil.copytree(self.used, directory)
+        for name in ("ram", "state", bench.OVERLAY_IMAGE_NAME):
+            (directory / name).write_bytes(b"x")
+        old = time.time() - 8 * 24 * 60 * 60
+        os.utime(directory, (old, old))
+
+        snapshot, captured = bench.ensure_snapshot(
+            runner, Path("/dev/null"), self.cache, 512, probe
+        )
+
+        self.assertIsNone(captured, "expected a cache hit, not a capture")
+        self.assertEqual(directory, snapshot.ram.parent)
+        self.assertGreater(
+            directory.stat().st_mtime, time.time() - 7 * 24 * 60 * 60,
+            "a cache hit must refresh the mtime pruning reads",
+        )
+        bench.prune_stale_snapshots(self.cache)
+        self.assertTrue(directory.is_dir())
 
 
 class PortReservationTest(unittest.TestCase):
