@@ -369,5 +369,69 @@ class ReadyProbeCommandTest(unittest.TestCase):
             )
 
 
+class FleetEntropyIndependenceTest(unittest.TestCase):
+    """Two restored VMs must not draw from one captured RNG stream.
+
+    The write-isolation canary cannot see this: an identical entropy stream is
+    not a cross-VM write leak, so each node's own round trip still passes. If
+    this regressed, a fleet test that generated keys per node would be drawing
+    from shared state without any check failing.
+    """
+
+    def _run(self, draws: list[bytes], expect_error: bool) -> None:
+        vms = [SimpleNamespace(index=i + 1, ssh_port=22200 + i) for i in range(2)]
+        completed = [subprocess.CompletedProcess([], 0, stdout=d.decode(), stderr="")
+                     for d in draws]
+        with mock.patch.object(bench, "run_checked", side_effect=completed):
+            if expect_error:
+                with self.assertRaises(bench.HarnessError):
+                    bench.assert_fleet_entropy_is_independent(
+                        vms, Path("/dev/null"), "/nix/store/p/probe"
+                    )
+            else:
+                bench.assert_fleet_entropy_is_independent(
+                    vms, Path("/dev/null"), "/nix/store/p/probe"
+                )
+
+    def test_distinct_draws_pass(self) -> None:
+        self._run([b"a" * 32, b"b" * 32], expect_error=False)
+
+    def test_identical_draws_fail(self) -> None:
+        # The whole point: a shared stream must be caught, not tolerated.
+        self._run([b"c" * 32, b"c" * 32], expect_error=True)
+
+    def test_a_short_draw_fails(self) -> None:
+        self._run([b"a" * 32, b"b"], expect_error=True)
+
+    def test_a_single_vm_is_refused(self) -> None:
+        # Two nodes is the minimum that can distinguish a replayed stream.
+        with self.assertRaisesRegex(bench.HarnessError, "at least two VMs"):
+            bench.assert_fleet_entropy_is_independent(
+                [SimpleNamespace(index=1, ssh_port=22201)], Path("/dev/null"), "/p"
+            )
+
+    def test_the_command_uses_the_supplied_binary_and_byte_count(self) -> None:
+        seen = []
+        vms = [SimpleNamespace(index=i + 1, ssh_port=22200 + i) for i in range(2)]
+
+        def record(description, command, timeout):
+            seen.append(list(command))
+            return subprocess.CompletedProcess([], 0, stdout="x" * 32, stderr="")
+
+        with mock.patch.object(bench, "run_checked", side_effect=record):
+            with self.assertRaises(bench.HarnessError):  # identical stdout
+                bench.assert_fleet_entropy_is_independent(
+                    vms, Path("/dev/null"), "/nix/store/xyz-probe/bin/fanout-probe"
+                )
+        # The whole flag and count travel as the single remote-command argument.
+        self.assertEqual(
+            [
+                f"/nix/store/xyz-probe/bin/fanout-probe --entropy {bench.ENTROPY_BYTES}",
+                f"/nix/store/xyz-probe/bin/fanout-probe --entropy {bench.ENTROPY_BYTES}",
+            ],
+            [c[-1] for c in seen],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

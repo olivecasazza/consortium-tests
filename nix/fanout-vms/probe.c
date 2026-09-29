@@ -22,7 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
 /* Write every byte or report why not. A short write is normal, not an error. */
 static int write_all(int fd, const char *buf, size_t len)
 {
@@ -38,6 +37,51 @@ static int write_all(int fd, const char *buf, size_t len)
         }
         off += (size_t)written;
     }
+    return 0;
+}
+
+/* Second mode: emit N bytes of fresh kernel entropy on stdout.
+ *
+ * Every restore shares the captured RAM image, so the harness has to be able
+ * to tell whether two nodes are drawing from independent RNG state or
+ * replaying one captured stream. It lives here rather than in a shell
+ * pipeline so the check does not depend on which coreutils the guest's PATH
+ * happens to contain.
+ */
+static int emit_entropy(long want)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+
+    if (fd < 0) {
+        fprintf(stderr, "open /dev/urandom: %s\n", strerror(errno));
+        return -1;
+    }
+    char buf[512];
+    long left = want;
+
+    while (left > 0) {
+        size_t ask = (size_t)(left < (long)sizeof(buf) ? left : (long)sizeof(buf));
+        ssize_t got = read(fd, buf, ask);
+
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "read /dev/urandom: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        if (got == 0) {
+            fprintf(stderr, "/dev/urandom returned short\n");
+            close(fd);
+            return -1;
+        }
+        if (write_all(STDOUT_FILENO, buf, (size_t)got) != 0) {
+            close(fd);
+            return -1;
+        }
+        left -= got;
+    }
+    close(fd);
     return 0;
 }
 
@@ -73,8 +117,22 @@ int main(int argc, char **argv)
     size_t len = 0, cap = 0;
     int rc = 1;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s FILE\n", argv[0]);
+    if (argc == 3 && strcmp(argv[1], "--entropy") == 0) {
+        char *end = NULL;
+        long want = strtol(argv[2], &end, 10);
+
+        if (!end || *end != '\0' || want <= 0 || want > 65536) {
+            fprintf(stderr, "usage: %s --entropy BYTES (1..65536)\n", argv[0]);
+            return 2;
+        }
+        return emit_entropy(want) == 0 ? 0 : 1;
+    }
+    if (argc != 2 || argv[1][0] == '-') {
+        /* A path starting with '-' is a mistyped flag, not a file. Without
+         * this, `--entropy` with no count falls through to the file branch,
+         * creates a file by that name, and then blocks reading stdin. */
+        fprintf(stderr, "usage: %s FILE\n"
+                        "       %s --entropy BYTES\n", argv[0], argv[0]);
         return 2;
     }
     const char *path = argv[1];

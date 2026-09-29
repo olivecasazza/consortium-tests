@@ -50,6 +50,8 @@ READY_PROBE_TIMEOUT_S = 10.0
 # qcow2 overlay, or the host. /nix/.rw-store is the ext4 volume from
 # microvm.volumes[]; assert_probe_file_is_durable keeps it that way.
 READY_PROBE_FILE = "/nix/.rw-store/fanout-ready-probe"
+# Bytes per node for the restored-guest entropy independence check.
+ENTROPY_BYTES = 32
 # The remote command that performs the exchange is supplied by the caller
 # (--ready-probe-command), because the probe binary lives in the guest's store
 # closure and its path is a build output. The verification stays here and is
@@ -968,6 +970,50 @@ def assert_fleet_state_is_independent(vms: Sequence[VmProcess], ssh_key: Path) -
         collect_parallel_failures("fleet state independence", futures)
 
 
+def assert_fleet_entropy_is_independent(
+    vms: Sequence[VmProcess], ssh_key: Path, ready_probe_binary: str
+) -> None:
+    """Two restored VMs must not draw from one captured RNG stream.
+
+    Every restore maps the same captured RAM image copy-on-write, so a guest
+    whose kernel RNG came from that image rather than from the host would hand
+    every node the same bytes. virtio-rng pulls from the host, so restored
+    nodes should differ - but the write-isolation canary cannot see this,
+    because an identical entropy stream is not a cross-VM write leak. Assert it
+    instead of assuming it, because a fleet test that generates keys or tokens
+    per node would silently be drawing from shared state.
+
+    Two nodes is enough to catch a replayed stream and keeps the cost at two
+    SSH round trips out of 64.
+    """
+    if len(vms) < 2:
+        raise HarnessError("entropy independence needs at least two VMs")
+
+    def draw(vm: VmProcess) -> bytes:
+        result = run_checked(
+            f"VM {vm.index} entropy draw",
+            host_ssh_command(
+                ssh_key, vm.ssh_port, f"{ready_probe_binary} --entropy {ENTROPY_BYTES}"
+            ),
+            timeout=VERIFY_TIMEOUT_S,
+        )
+        return result.stdout.encode("utf-8", errors="surrogateescape")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.map(draw, (vms[0], vms[1]))
+    if len(first) < ENTROPY_BYTES or len(second) < ENTROPY_BYTES:
+        raise HarnessError(
+            f"entropy draw too short: VM 1 returned {len(first)} bytes, "
+            f"VM 2 returned {len(second)} bytes, expected at least {ENTROPY_BYTES}"
+        )
+    if first == second:
+        raise HarnessError(
+            "restored guests share one RNG stream: VM 1 and VM 2 produced "
+            f"identical {len(first)}-byte draws, so entropy is coming from the "
+            "captured RAM image rather than the host"
+        )
+
+
 def prove_guest_gateway_relay(ssh_key: Path) -> None:
     peer_command = shlex.join(
         [
@@ -1400,6 +1446,9 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
 
         assert_probe_file_is_durable(vms[0], ssh_key)
         assert_fleet_state_is_independent(vms, ssh_key)
+        assert_fleet_entropy_is_independent(
+            vms, ssh_key, args.ready_probe_binary
+        )
         prove_guest_gateway_relay(ssh_key)
         assert_store_path_absent(vms, ssh_key, args.store_path)
         inventory_content = write_inventory(run_dir / "inventory.toml", args.count)
@@ -1452,6 +1501,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 "ssh_data_exchange_verified": args.count,
                 # Every VM still held its own nonce after the whole fleet came up.
                 "state_isolation_verified": args.count,
+                "entropy_isolation_verified": args.count,
                 "store_paths_verified": args.count,
             },
         }
