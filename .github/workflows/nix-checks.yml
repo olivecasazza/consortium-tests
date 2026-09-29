@@ -1,0 +1,37 @@
+name: Nix Checks
+
+# The 64-node `fanout64` fleet lives in this repo (nix/fanout-vms/), so its
+# launcher safety tests belong here too. The benchmark itself needs Linux + KVM
+# and is run manually; `checks.fanout-bench-test` is pure Python and runs on any
+# runner with Nix, which is what catches a launcher regression such as the
+# TIME_WAIT host-port collision that once made a second consecutive 64-node run
+# fail to bind.
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: nix-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fanout:
+    name: Fanout launcher tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v2
+
+      - uses: DeterminateSystems/nix-installer-action@v4
+
+      - name: Run Nix checks
+        run: nix flake check --no-build
+
+      - name: Run the launcher safety tests
+        run: nix build .#checks.x86_64-linux.fanout-bench-test
