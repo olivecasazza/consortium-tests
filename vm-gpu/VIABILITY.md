@@ -4,6 +4,7 @@ Measured on pdx-nxst-001, Quadro RTX 6000 (CC 7.5, driver 595.84) via Vulkan.
 Stack VM in WGSL (one VM per GPU invocation), CPU scalar reference, identical
 opcodes and identical instruction accounting. `work_match=yes` on every run:
 the GPU and CPU executed exactly the same number of VM instructions.
+
 ## Results
 
 Measured on one build, with the readback timed separately from the kernel
