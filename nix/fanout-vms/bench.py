@@ -324,6 +324,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        help=(
+            "directory to record the cascade event stream in, including when "
+            "the relay check rejects the run. It must survive the run: the "
+            "fleet's own scratch directory is removed during cleanup, which "
+            "is exactly when the evidence matters most"
+        ),
+    )
+    parser.add_argument(
         "--cascade-tree-module",
         required=True,
         type=Path,
@@ -1058,6 +1068,17 @@ def verify_cascade_relay(
     }
 
 
+def write_cascade_evidence(evidence_dir: Path | None, stream: str) -> None:
+    """Record a cascade's event stream where it survives cleanup."""
+    if evidence_dir is None:
+        return
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "cascade-events.jsonl").write_text(stream, encoding="utf-8")
+    except OSError as error:
+        raise HarnessError(f"cannot record the cascade event stream: {error}") from error
+
+
 def run_cascade(
     ssh_key: Path,
     store_path: Path,
@@ -1066,6 +1087,7 @@ def run_cascade(
     *,
     count: int,
     fanout: int,
+    evidence_dir: Path | None = None,
 ) -> dict[str, int]:
     """Distribute one closure across the fleet and prove the relay was used.
 
@@ -1083,6 +1105,15 @@ def run_cascade(
         timeout=VERIFY_TIMEOUT_S,
         input_text=inventory_content,
     )
+    # The stream is evidence, and a cascade that fails is exactly when it is
+    # needed, so take it whichever way the command ends. `run_checked` truncates
+    # a failing command's output in the error it raises, and it raises *before*
+    # returning, so a post-hoc write recorded nothing when it mattered most.
+    def record(result: subprocess.CompletedProcess[str]) -> None:
+        # Runs inside run_checked, before it raises. Recording after the call
+        # would be dead code: a non-zero exit never returns.
+        write_cascade_evidence(evidence_dir, result.stdout)
+
     completed = run_checked(
         "guest cascade-copy",
         host_ssh_command(
@@ -1091,10 +1122,10 @@ def run_cascade(
             cascade_command(store_path, INVENTORY_GUEST_PATH, fanout=fanout),
         ),
         timeout=CASCADE_TIMEOUT_S,
+        on_failure=record,
     )
-    return verify_cascade_relay(
-        completed.stdout, module, count=count, fanout=fanout
-    )
+    write_cascade_evidence(evidence_dir, completed.stdout)
+    return verify_cascade_relay(completed.stdout, module, count=count, fanout=fanout)
 
 
 def assert_probe_file_is_durable(vm: VmProcess, ssh_key: Path) -> None:
@@ -1298,6 +1329,7 @@ def assert_vm_store_path_absent(
 def deploy_and_verify(
     vms: Sequence[VmProcess],
     ssh_key: Path,
+    evidence_dir: Path | None,
     cascade_tree_module: Path,
     store_path: Path,
     inventory_content: str,
@@ -1330,6 +1362,7 @@ def deploy_and_verify(
         load_cascade_tree_module(cascade_tree_module),
         count=len(vms),
         fanout=2,
+        evidence_dir=evidence_dir,
     )
 
     verify_all_store_paths(vms, ssh_key, store_path, binary_relative_path, expected_stdout)
@@ -1400,6 +1433,7 @@ def run_checked(
     timeout: float,
     env: dict[str, str] | None = None,
     input_text: str | None = None,
+    on_failure: Callable[[subprocess.CompletedProcess[str]], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -1417,6 +1451,11 @@ def run_checked(
     except OSError as error:
         raise HarnessError(f"{description} could not start: {error}") from error
     if result.returncode != 0:
+        if on_failure is not None:
+            # Hand over the full output before raising. A caller that has to
+            # explain a failure needs the whole thing, not the tail the error
+            # message carries.
+            on_failure(result)
         raise HarnessError(
             f"{description} exited with status {result.returncode}: "
             f"{summarize_output(result.stdout, result.stderr)}"
@@ -1620,6 +1659,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         deployment_s, cascade_topology = deploy_and_verify(
             vms,
             ssh_key,
+            args.evidence_dir,
             args.cascade_tree_module,
             args.store_path,
             inventory_content,
@@ -1660,7 +1700,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 # Not the CLI's exit status: the tree the run actually built.
                 # A cascade that pushed host-to-each-guest exits 0 and would
                 # otherwise be recorded identically to a real fan-out.
-                "cascade_relay_verified": count,
+                "cascade_relay_verified": args.count,
                 "guest_gateway_relay": "ok",
                 "host_to_seed": "ok",
                 "payload_executions_verified": args.count,

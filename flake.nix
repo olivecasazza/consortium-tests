@@ -22,7 +22,7 @@
       # HTTPS, not SSH: Nix Checks runs on a GitHub-hosted runner that holds no
       # key for this host, and the repo is public, so the fetch must not need
       # one. The ref/rev pin is what matters; the transport is incidental.
-      url = "git+https://github.com/olivecasazza/consortium?ref=feat/cascade-copy-jsonl&rev=98b99542536accb73b5234cca1f631d73eebd554";
+      url = "git+https://github.com/olivecasazza/consortium?ref=master&rev=799541f9c47117b9b9c513633d1f5c925abe6650";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Claude Code plugin marketplace of hand-crafted agent skills, vendored at
