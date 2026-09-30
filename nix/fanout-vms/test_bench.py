@@ -1812,6 +1812,23 @@ def echo_nonce(command: Any, **kwargs: Any) -> Any:
     return SimpleNamespace(returncode=0, stdout=kwargs.get("input", ""), stderr="")
 
 
+def report_reprobed_address(vm: Any, ssh_key: Path, report_port: int) -> None:
+    """An issue_guest_nic_reprobe that sends the report the guest ends with.
+
+    The re-probe is asked for over SSH and deliberately not waited on, because
+    the guest's own report is the only thing that says it worked. That makes
+    the report the whole contract of this call, so a stand-in that answers the
+    SSH exchange and reports nothing leaves collect_nic_reprobe_reports
+    accepting on a listener nobody will ever connect to, until it has spent the
+    full NIC_REPROBE_TIMEOUT_S doing it. Every control run in this class is
+    denied during readiness and so never asks for a re-probe, but a run whose
+    health checks all answer does, and it was paying that whole budget to reach
+    a failure it could reach in one.
+    """
+    with socket.create_connection(("127.0.0.1", report_port), timeout=5) as client:
+        client.sendall(f"{vm.index} 10.0.2.{16 + vm.index}\n".encode())
+
+
 class ReadyHealthHandler(http.server.BaseHTTPRequestHandler):
     """The guest's side of the readiness check: HEALTH_BODY on /health."""
 
@@ -2026,6 +2043,11 @@ class ReadinessNegativeControlTest(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(bench.subprocess, "run", side_effect=echo_nonce)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    bench, "issue_guest_nic_reprobe", side_effect=report_reprobed_address
+                )
             )
             stack.enter_context(
                 mock.patch.object(bench, "connect_qmp", return_value=closed_socket())
