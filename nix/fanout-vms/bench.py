@@ -51,6 +51,15 @@ READY_PROBE_TIMEOUT_S = 10.0
 # qcow2 overlay, or the host. /nix/.rw-store is the ext4 volume from
 # microvm.volumes[]; assert_probe_file_is_durable keeps it that way.
 READY_PROBE_FILE = "/nix/.rw-store/fanout-ready-probe"
+# The bytes a ready guest serves on /health, and the word check_http_health
+# reports for a health request that got them. Both are recorded per node: a
+# run that fails on readiness has to say which leg of the exchange stopped
+# answering, and an expired deadline on its own says neither.
+HEALTH_BODY = b"ready\n"
+HEALTH_OK = "ready"
+# The readiness exchange's name for an SSH leg that passed: the exact bytes
+# the probe sent came back out of the guest's store.
+SSH_EXCHANGE_OK = "nonce echoed"
 # Random bytes each node draws for the restored-guest entropy check. The
 # guest prints them hex-encoded, so 32 bytes arrive as 64 characters.
 ENTROPY_BYTES = 32
@@ -64,6 +73,26 @@ TERMINATE_GRACE_S = 5.0
 INVENTORY_GUEST_PATH = "/tmp/consortium-fanout-inventory.toml"
 # Must match microvm.volumes[].image in guest.nix; the runner creates it in cwd.
 OVERLAY_IMAGE_NAME = "overlay.img"
+# The three octets every per-VM address starts from: 0x02 is the
+# locally-administered bit, and the low bit of the address stays clear, so the
+# result is a unicast address the host network cannot already own. guest.nix
+# matches its network on the interface name, not on this, because the address
+# differs per launch.
+GUEST_MAC_PREFIX = 0x020000
+GUEST_MAC_INDEX_LIMIT = 0xFFFFFF
+# The interface the guest reads its own address from. guest.nix pins this
+# name with a .link unit, so it is the name the captured guest and all 64
+# restores have; the harness asks for the address by this name.
+GUEST_NIC_NAME = "net0"
+# The guest-side ports the two host forwards carry. Named because a forward
+# is a claim about one of them, and which one it is has to be readable where
+# the forward is issued.
+GUEST_SSH_PORT = 22
+GUEST_HEALTH_PORT = 8080
+# QEMU holds the address it programmed into a NIC as a QOM property, which is
+# the host's own view of the device and needs no help from the guest to read.
+QMP_PERIPHERAL_PATH = "/machine/peripheral"
+QMP_NIC_MAC_PROPERTY = "mac"
 # RAM-backed home for the fleet's -snapshot disk overlays (see create_vm_scratch).
 VM_SCRATCH_ROOT = Path("/dev/shm")
 # Per-guest RAM-scratch allowance for the qcow2 overlay itself, its ext4
@@ -104,6 +133,22 @@ SNAPSHOT_CAPABILITIES = {
 
 class HarnessError(RuntimeError):
     """An actionable benchmark failure."""
+
+
+class BenchmarkFailed(HarnessError):
+    """A run that failed, carrying what it had measured when it did.
+
+    A run stops at the first check it cannot pass, but the phases before that
+    point have already recorded what they measured, and a reader given only
+    the message has to repeat the whole run to recover it. The report travels
+    with the failure so main can print it where the result of a passing run
+    is printed, which keeps a failed run's output as readable as a passing
+    one's.
+    """
+
+    def __init__(self, message: str, report: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.report = report
 
 
 def load_cascade_tree_module(path: Path) -> Any:
@@ -172,6 +217,34 @@ def guest_ram_args(ram: Path, ram_mib: int, *, share: bool) -> list[str]:
     ]
 
 
+def guest_mac(index: int) -> str:
+    """The MAC address of VM ``index`` (1-based, as every VM number here).
+
+    Nothing in a restored guest is written per VM: 64 of them resume one
+    captured snapshot, so the address cannot be burned into the image and
+    fw_cfg is read only at boot, which a restore never reaches. The NIC's
+    address is set per launch instead, and the guest reads it back from the
+    device. 0x02 in the top octet marks it locally administered and the low
+    bit stays clear, so it is unicast and cannot collide with a vendor
+    address on the host network. The index fills the low three octets, so VM
+    1 keeps 02:00:00:00:00:01, the address the capture was taken with.
+    """
+    if not 1 <= index <= GUEST_MAC_INDEX_LIMIT:
+        raise HarnessError(f"VM {index}: index is out of range for a derived MAC address")
+    packed = GUEST_MAC_PREFIX << 24 | index
+    return ":".join(f"{octet:02x}" for octet in packed.to_bytes(6, "big"))
+
+
+def guest_mac_args(index: int) -> list[str]:
+    """QEMU arguments giving this launch its own NIC address.
+
+    guest.nix leaves the interface without an address, so -global is the
+    only source: an explicit mac= on -device wins over it, and QEMU's own
+    fallback is the same 52:54:00:12:34:56 for every VM.
+    """
+    return ["-global", f"virtio-net-pci.mac={guest_mac(index)}"]
+
+
 @dataclass
 class VmProcess:
     index: int
@@ -187,6 +260,26 @@ class VmProcess:
     # overlay, so a leak between VMs is the failure mode every restore
     # optimization could introduce; the nonce is what makes it detectable.
     probe_nonce: str | None = None
+    # The address this guest read out of its own NIC, and the one QEMU holds
+    # for it. They are recorded from opposite sides so a disagreement can be
+    # attributed to the device or to the guest rather than guessed at.
+    guest_address: str | None = None
+    device_address: str | None = None
+    # The last reading from each side of this VM's readiness exchange. The
+    # loop's locals are gone once it raises, and a run that stops on
+    # readiness has to publish which leg stopped rather than only that a
+    # deadline passed.
+    last_ssh_result: str = "not attempted"
+    last_http_result: str = "not attempted"
+    # False for a node whose health forward the launch withheld. Nothing
+    # downstream is told: its readiness loop polls its health port exactly as
+    # every other node's is polled and finds nothing listening.
+    health_forwarded: bool = True
+    # Whether this VM's readiness exchange both legs ever completed. A node
+    # whose exchange is still unfinished when the run stops is the node the
+    # run stopped on, which a last reading alone does not say: a launcher that
+    # accepted a failed health leg would have a reading and no failure.
+    ready: bool = False
 
 class QmpConnection:
     """Minimal line-oriented QEMU Machine Protocol client."""
@@ -348,13 +441,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--ready-probe-binary",
         required=True,
         help=(
-            "guest binary that performs the readiness data exchange: it must "
-            "read stdin, write it to " + READY_PROBE_FILE + ", fsync, and write "
-            "the bytes it reads back to stdout. Required, and the only part of "
-            "the probe the caller supplies, because it is a guest store path "
-            "that only the build knows. The file path and the comparison stay "
-            "here: stdout must equal the nonce byte for byte, so a wrong binary "
-            "fails loudly rather than passing quietly"
+            "guest binary that performs the readiness data exchange and "
+            "reports the guest's own NIC address: it must read stdin, write it "
+            "to " + READY_PROBE_FILE + ", fsync, and write the bytes it reads "
+            "back to stdout, and it must answer --address INTERFACE with the "
+            "address that interface currently has, read at the time it is "
+            "asked. Required, and the only part of the probe the caller "
+            "supplies, because it is a guest store path that only the build "
+            "knows. The file path and both comparisons stay here: stdout must "
+            "equal the nonce byte for byte, and the reported address must be "
+            "the one this launch assigned, so a wrong binary fails loudly "
         ),
     )
     parser.add_argument(
@@ -386,10 +482,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="guest RAM size the runner passes to -m (required with --boot snapshot)",
     )
+    parser.add_argument(
+        "--negative-control-vm",
+        type=int,
+        metavar="N",
+        help=(
+            "negative control: withhold node N's health forward and require the run "
+            "to be rejected for that node (N is 1-based, as every VM number here; "
+            "default: off, every node is checked)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not 2 <= args.count <= MAX_VM_COUNT:
         parser.error(f"--count must be between 2 and {MAX_VM_COUNT}")
+    if args.negative_control_vm is not None and not 1 <= args.negative_control_vm <= args.count:
+        parser.error(
+            "--negative-control-vm must name a node of this fleet: 1-based, as every "
+            f"VM number here, so between 1 and --count ({args.count})"
+        )
     if args.startup_deadline <= 0:
         parser.error("--startup-deadline must be greater than zero")
     binary_relative_path = PurePosixPath(args.binary_relative_path)
@@ -494,6 +605,10 @@ def launch_vms(
     snapshot: Snapshot | None = None,
     extra_args: Sequence[str] = (),
     scratch: Path | None = None,
+    # The node whose health forward this launch withholds, for the readiness
+    # negative control. None is every node forwarded, which is what every run
+    # that is not a control gets.
+    withheld_health: int | None = None,
 ) -> None:
     # A restore waits for its state via QMP (-incoming defer). Every restore
     # shares the captured disk; -snapshot sends this VM's writes to a
@@ -503,6 +618,10 @@ def launch_vms(
         argv += ["-snapshot", "-incoming", "defer"]
         argv += guest_ram_args(snapshot.ram, snapshot.ram_mib, share=False)
     for index in range(1, count + 1):
+        # The address is per launch, so it belongs to this VM's argv and not to
+        # the shared one above: the capture guest is VM 1 of its own run and the
+        # fleet restores 64 copies of it that must not answer to one address.
+        vm_argv = [*argv, *guest_mac_args(index)]
         workdir = run_dir / f"vm{index}"
         workdir.mkdir(mode=0o700)
         qmp_socket = workdir / QMP_SOCKET_NAME
@@ -533,7 +652,7 @@ def launch_vms(
         child_env["TMPDIR"] = str(vm_tmpdir)
         try:
             process = subprocess.Popen(
-                argv,
+                vm_argv,
                 cwd=workdir,
                 env=child_env,
                 stdin=subprocess.DEVNULL,
@@ -555,6 +674,7 @@ def launch_vms(
                 process=process,
                 process_group=process.pid,
                 log=log,
+                health_forwarded=index != withheld_health,
             )
         )
 
@@ -614,10 +734,17 @@ def bring_up_vm(
         # Keep the ports reserved until QEMU is ready to bind them. QMP errors
         # remain authoritative if another process wins the small close/bind race.
         reservation.close()
-        commands = (
-            f"hostfwd_add net0 tcp:127.0.0.1:{vm.ssh_port}-:22",
-            f"hostfwd_add net0 tcp:127.0.0.1:{vm.http_port}-:8080",
-        )
+        commands = [f"hostfwd_add net0 tcp:127.0.0.1:{vm.ssh_port}-:{GUEST_SSH_PORT}"]
+        if vm.health_forwarded:
+            # A withheld health forward is a missing route to the guest's
+            # /health, which is what the negative control denies one node: the
+            # readiness check polls that node's port exactly as it polls every
+            # other node's and finds nothing listening, so the failure is the
+            # one a guest that never serves health produces, made without
+            # anything in the readiness path being told which node it is.
+            commands.append(
+                f"hostfwd_add net0 tcp:127.0.0.1:{vm.http_port}-:{GUEST_HEALTH_PORT}"
+            )
         for command in commands:
             result = qmp.execute(
                 "human-monitor-command",
@@ -635,8 +762,67 @@ def bring_up_vm(
             qmp.execute("migrate-incoming", {"uri": f"file:{snapshot.state}"}, deadline)
             wait_for_migration(qmp, vm.index, deadline)
             qmp.execute("cont", None, deadline)
+        # After cont, so this reads the device as the restore left it rather
+        # than as the launch arguments described it.
+        #
+        # ESTABLISHED, and enforced here: the address this launch assigned is
+        # the address QEMU holds for this VM's NIC. -global is the only source
+        # of that address (guest_mac_args), so a device holding a different one
+        # was never given it, and no guest-side reading can be told apart from
+        # that: the same fleet-wide result follows from a device given the
+        # wrong address and from a guest that read the right one wrongly.
+        #
+        # NOT ESTABLISHED, and only reported: that the running guest's own view
+        # of the device is this address. The guest kernel reads a NIC address
+        # when the driver probes the device and keeps it in dev_addr from then
+        # on, and a restore carries the capture-time device state with it, so
+        # a guest can legitimately name the address the capture was taken with
+        # rather than the one this launch passed. Whether it does has not been
+        # established against a real capture and restore cycle, so
+        # assert_fleet_node_identity_is_per_launch records it per node beside
+        # the address read here rather than assuming it either way.
+        vm.device_address = qmp.execute(
+            "qom-get",
+            {
+                "path": find_nic_qom_path(qmp, vm.index, deadline),
+                "property": QMP_NIC_MAC_PROPERTY,
+            },
+            deadline,
+        )
+        assigned = guest_mac(vm.index)
+        if vm.device_address != assigned:
+            raise HarnessError(
+                f"VM {vm.index}: QEMU holds address {vm.device_address!r} for this VM's "
+                f"NIC, but this launch assigned it {assigned!r}"
+            )
     finally:
         connection.close()
+
+
+
+def find_nic_qom_path(qmp: QmpConnection, vm_index: int, deadline: float) -> str:
+    """The QOM path of this VM's NIC.
+
+    qom-get addresses a property by path and the runner does not name the NIC,
+    so the peripheral is identified by device type rather than by an id this
+    harness would have to guess. Anything other than exactly one match is
+    refused rather than resolved: a machine with no NIC has no address to
+    report, and one with two has no single answer.
+    """
+    peripherals = qmp.execute("qom-list", {"path": QMP_PERIPHERAL_PATH}, deadline)
+    paths = [
+        f"{QMP_PERIPHERAL_PATH}/{entry['name']}"
+        for entry in peripherals
+        if isinstance(entry, dict)
+        and entry.get("name")
+        and "virtio-net" in str(entry.get("type", ""))
+    ]
+    if len(paths) != 1:
+        raise HarnessError(
+            f"VM {vm_index}: expected one virtio-net NIC under {QMP_PERIPHERAL_PATH}, "
+            f"found {len(paths)}"
+        )
+    return paths[0]
 
 
 def start_all_vms(
@@ -888,8 +1074,8 @@ def wait_for_vm_ready(
 ) -> None:
     ssh_ready = False
     http_ready = False
-    last_ssh_error = "not attempted"
-    last_http_error = "not attempted"
+    last_ssh_result = "not attempted"
+    last_http_result = "not attempted"
 
     while not (ssh_ready and http_ready):
         if vm.process.poll() is not None:
@@ -902,7 +1088,7 @@ def wait_for_vm_ready(
         if remaining <= 0:
             raise HarnessError(
                 f"VM {vm.index}: readiness deadline expired; "
-                f"last SSH result: {last_ssh_error}; last HTTP result: {last_http_error}"
+                f"last SSH result: {last_ssh_result}; last HTTP result: {last_http_result}"
             )
 
         if not ssh_ready:
@@ -935,26 +1121,34 @@ def wait_for_vm_ready(
                     close_fds=False,
                 )
             except subprocess.TimeoutExpired:
-                last_ssh_error = "check timed out"
+                last_ssh_result = "check timed out"
             except OSError as error:
-                last_ssh_error = str(error)
+                last_ssh_result = str(error)
             else:
                 if result.returncode != 0:
-                    last_ssh_error = summarize_output(result.stdout, result.stderr)
+                    last_ssh_result = summarize_output(result.stdout, result.stderr)
                 elif result.stdout != nonce:
-                    last_ssh_error = (
+                    last_ssh_result = (
                         f"data exchange mismatch: sent {nonce!r}, read back {result.stdout!r}"
                     )
                 else:
                     ssh_ready = True
                     vm.probe_nonce = nonce
+                    # What this leg last said, kept on the VM so the report of a
+                    # run that stops here can be read without the run.
+                    last_ssh_result = SSH_EXCHANGE_OK
 
         remaining = deadline - time.monotonic()
         if not http_ready and remaining > 0:
-            http_ready, last_http_error = check_http_health(vm.http_port, remaining)
+            http_ready, last_http_result = check_http_health(vm.http_port, remaining)
+
+        vm.last_ssh_result = last_ssh_result
+        vm.last_http_result = last_http_result
 
         if not (ssh_ready and http_ready):
             time.sleep(min(0.03, max(0.0, deadline - time.monotonic())))
+
+    vm.ready = True
 
 
 def check_http_health(port: int, remaining: float) -> tuple[bool, str]:
@@ -974,9 +1168,9 @@ def check_http_health(port: int, remaining: float) -> tuple[bool, str]:
 
     if response.status != 200:
         return False, f"HTTP {response.status}, body={body!r}"
-    if body != b"ready\n":
-        return False, f"expected b'ready\\n', got {body!r}"
-    return True, "ready"
+    if body != HEALTH_BODY:
+        return False, f"expected {HEALTH_BODY!r}, got {body!r}"
+    return True, HEALTH_OK
 
 
 def collect_parallel_failures(
@@ -1228,6 +1422,151 @@ def assert_fleet_entropy_is_independent(
             f"identical {ENTROPY_BYTES}-byte draws, so entropy is coming from the "
             "captured RAM image rather than the host"
         )
+
+
+def parse_reported_address(reported: str, vm_index: int) -> str:
+    """Normalize one reported NIC address, or refuse it.
+
+    sysfs prints lower-case colon-delimited hex, and that is the only shape
+    accepted: a value that is not an address cannot be compared against the one
+    this launch assigned, and passing it on would turn a broken read into a
+    mismatch reported against the wrong thing.
+    """
+    address = reported.strip().lower()
+    octets = address.split(":")
+    if len(octets) != 6 or any(
+        len(octet) != 2 or octet.strip("0123456789abcdef") for octet in octets
+    ):
+        raise HarnessError(
+            f"VM {vm_index}: reported address {reported!r} is not a MAC address"
+        )
+    return address
+
+
+def fetch_guest_address(vm: VmProcess, ssh_key: Path, probe_binary: str) -> str:
+    """Ask this VM what address its own NIC currently has.
+
+    The probe binary is the one the readiness exchange already runs, in a mode
+    that reads the address out of sysfs per invocation, so this costs one SSH
+    round trip and depends on nothing computed when the guest image was built.
+    """
+    result = run_checked(
+        f"VM {vm.index} reported address",
+        host_ssh_command(
+            ssh_key, vm.ssh_port, f"{probe_binary} --address {GUEST_NIC_NAME}"
+        ),
+        timeout=VERIFY_TIMEOUT_S,
+    )
+    return parse_reported_address(result.stdout, vm.index)
+
+
+def assert_fleet_node_identity_is_per_launch(
+    vms: Sequence[VmProcess], ssh_key: Path, probe_binary: str
+) -> None:
+    """Every node must report the address its own launch gave it.
+
+    The address is what tells 64 restored guests apart, and nothing else in
+    the run can see whether it arrived: each VM's readiness exchange passes
+    with one shared address for the whole fleet, as does the cascade, which
+    addresses nodes by their forwarded port. So each node reads the address
+    out of its own device and has to name the one this launch assigned it.
+
+    Two different things are measured, and only one of them is established.
+    That the per-launch address reached the device is established and
+    enforced in bring_up_vm, which reads it back from QEMU. That the guest's
+    own view of the device is that address is checked here but NOT
+    established: the kernel caches a probed NIC address in dev_addr and a
+    restore carries the capture-time state with it, so a guest can name the
+    capture-time address without the injection having failed. That has not
+    been established against a real capture and restore cycle either way, so
+    it is not assumed here: every node's answer is recorded before any
+    failure is raised, and node_identity_report publishes each answer beside
+    the address QEMU holds for the device it read. A node naming a different
+    address fails the run, because a fleet answering to one address is the
+    outcome this check exists to catch, and it fails with the measurement
+    that explains it rather than without.
+
+    The host's view of the same device is quoted in the failure so the side
+    the disagreement is on is named: a guest reading the capture-time address
+    while QEMU holds this VM's own is a different problem from a device that
+    was never given one, which bring_up_vm has already refused.
+    """
+    def check(vm: VmProcess) -> None:
+        reported = fetch_guest_address(vm, ssh_key, probe_binary)
+        vm.guest_address = reported
+        expected = guest_mac(vm.index)
+        if reported != expected:
+            held = vm.device_address
+            raise HarnessError(
+                f"VM {vm.index}: the guest reports address {reported!r}, but this "
+                f"launch assigned it {expected!r}"
+                + (
+                    ""
+                    if held is None
+                    else f"; QEMU holds {held!r} for this VM's NIC"
+                )
+                + ", so the guest is not using the address its device holds "
+                "and the nodes cannot be told apart by address"
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
+        futures = [executor.submit(check, vm) for vm in vms]
+        collect_parallel_failures("per-launch node identity", futures)
+
+
+def node_identity_status(vm: VmProcess) -> str:
+    """Which side of this node's address the disagreement is on.
+
+    Named rather than counted, because the three outcomes need different
+    responses and a single boolean would hide which one happened: a device
+    holding another launch's address is an injection that did not arrive (a
+    real defect, refused in bring_up_vm), a guest naming an address its
+    device does not hold is the kernel keeping the address it probed or the
+    restore carrying the capture's state (reported, not yet attributed), and
+    a node that never answered was never asked successfully.
+    """
+    if vm.device_address != guest_mac(vm.index):
+        return "device_mismatch"
+    if vm.guest_address is None:
+        return "unanswered"
+    if vm.guest_address == vm.device_address:
+        return "agrees_with_device"
+    return "diverges_from_device"
+
+
+def node_identity_report(vms: Sequence[VmProcess]) -> dict[str, Any]:
+    """Both sides of every node's address, for a passing run and a failed one.
+
+    The addresses are recorded on the VMs as the run reads them, so the same
+    measurement reaches the result of a run that passed and the report of one
+    that did not: what each node said its address was, what QEMU holds for
+    the device it read, and which side the disagreement falls on. That is
+    the measurement a guest-side divergence needs to be understood, and a run
+    which stops on one would otherwise discard it with the result it never
+    finished building.
+    """
+    return {
+        "device_addresses": {str(vm.index): vm.device_address for vm in vms},
+        "guest_addresses": {str(vm.index): vm.guest_address for vm in vms},
+        "node_statuses": {str(vm.index): node_identity_status(vm) for vm in vms},
+    }
+
+
+def readiness_report(vms: Sequence[VmProcess]) -> dict[str, Any]:
+    """What each side of every node's readiness exchange last said.
+
+    A readiness failure is a deadline, and a deadline alone cannot say which
+    leg of the exchange stopped answering: a node that never serves health and
+    a node that stopped answering both expire on the same clock. The last
+    reading from each leg is what tells them apart, so it is recorded as it
+    is taken and published by a run that failed on it.
+    """
+    return {
+        "http_ready": [str(vm.index) for vm in vms if vm.last_http_result == HEALTH_OK],
+        "ready": [str(vm.index) for vm in vms if vm.ready],
+        "last_http_results": {str(vm.index): vm.last_http_result for vm in vms},
+        "last_ssh_results": {str(vm.index): vm.last_ssh_result for vm in vms},
+    }
 
 
 def prove_guest_gateway_relay(ssh_key: Path) -> None:
@@ -1608,6 +1947,38 @@ def remove_vm_scratch(scratch: Path | None) -> list[str]:
     return []
 
 
+def failed_result(
+    vms: Sequence[VmProcess], failure: BaseException, cleanup_errors: Sequence[str]
+) -> dict[str, Any]:
+    """The run's result, as far as it got, published with the failure.
+
+    Every phase records what it measured on the way through, so a run that
+    stops at a check has the readings that explain why, and those readings
+    are the answer to the question the failure message can only pose. The
+    message is what main reports to the operator and is repeated here so the
+    published document is readable on its own, and the identity report is
+    the one that has to survive: the guest-side divergence it is written
+    for is exactly the failure that would otherwise be the only evidence.
+    """
+    if isinstance(failure, (HarnessError, KeyboardInterrupt)):
+        message = str(failure)
+    else:
+        message = f"unexpected harness failure: {failure}"
+    if cleanup_errors:
+        message = f"{message}; cleanup also failed: {'; '.join(cleanup_errors)}"
+    return {
+        "error": message,
+        "node_identities": node_identity_report(vms),
+        "readiness": readiness_report(vms),
+        "status": "failed",
+        "statuses": {
+            "node_identity_verified": sum(
+                1 for vm in vms if node_identity_status(vm) == "agrees_with_device"
+            ),
+        },
+    }
+
+
 def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     reservations: list[PortReservation] = []
     vms: list[VmProcess] = []
@@ -1639,7 +2010,15 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         )
         readiness_started = time.monotonic()
         fleet_runner = args.runner if snapshot is None else args.restore_runner
-        launch_vms(fleet_runner, run_dir, args.count, vms, snapshot, scratch=scratch)
+        launch_vms(
+            fleet_runner,
+            run_dir,
+            args.count,
+            vms,
+            snapshot,
+            scratch=scratch,
+            withheld_health=args.negative_control_vm,
+        )
         launch_s = time.monotonic() - readiness_started
         readiness_deadline = readiness_started + args.startup_deadline
         bring_up_max_s = start_all_vms(
@@ -1648,6 +2027,9 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
 
+        assert_fleet_node_identity_is_per_launch(
+            vms, ssh_key, args.ready_probe_binary
+        )
         assert_probe_file_is_durable(vms[0], ssh_key)
         assert_fleet_state_is_independent(vms, ssh_key)
         assert_fleet_entropy_is_independent(
@@ -1675,6 +2057,11 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             "snapshot_capture_s": (
                 None if snapshot_capture_s is None else round(snapshot_capture_s, 6)
             ),
+            # What each node said its own address was, beside what QEMU holds
+            # for the device it read, so which node answered and whether the
+            # two sides agree can be read off the run's output alone. The same
+            # report is published by a run that fails on it.
+            "node_identities": node_identity_report(vms),
             # What payload_executions_verified actually compared, so a reader
             # of that count can tell a real output check from an exit status.
             "payload": {
@@ -1712,6 +2099,13 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 # Every VM still held its own nonce after the whole fleet came up.
                 "state_isolation_verified": args.count,
                 "entropy_isolation_verified": args.count,
+                # Every VM whose guest named the address its own launch
+                # assigned it, which is what makes 64 restored nodes
+                # distinguishable. Counted from the readings rather than
+                # assumed, so the number means what a failed run reports too.
+                "node_identity_verified": sum(
+                    1 for vm in vms if node_identity_status(vm) == "agrees_with_device"
+                ),
                 "store_paths_verified": args.count,
             },
         }
@@ -1726,12 +2120,13 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
     cleanup_errors.extend(remove_vm_scratch(scratch))
 
     if failure is not None:
-        if cleanup_errors:
-            cleanup_detail = "; ".join(cleanup_errors)
-            raise HarnessError(f"{failure}; cleanup also failed: {cleanup_detail}") from failure
-        if isinstance(failure, (HarnessError, KeyboardInterrupt)):
+        report = failed_result(vms, failure, cleanup_errors)
+        # An interrupt the cleanup could honour is still an interrupt, and
+        # main's exit code for it says so; anything else, including an
+        # interrupt that left VMs behind, is a failure carrying its report.
+        if isinstance(failure, KeyboardInterrupt) and not cleanup_errors:
             raise failure
-        raise HarnessError(f"unexpected harness failure: {failure}") from failure
+        raise BenchmarkFailed(report["error"], report) from failure
     if cleanup_errors:
         raise HarnessError("benchmark succeeded but cleanup failed: " + "; ".join(cleanup_errors))
     if result is None:
@@ -1745,18 +2140,107 @@ def create_run_dir(tmpdir: Path) -> Path:
     except OSError as error:
         raise HarnessError(f"cannot create a fresh run directory under {tmpdir}: {error}") from error
 
+def control_detected(report: dict[str, Any], *, index: int, count: int) -> bool:
+    """Whether the run was rejected for this node's readiness and no other.
+
+    A harness that is not looking and a harness that is cannot be told apart
+    by the presence of a failure: any error would do, including one that
+    failed for an unrelated reason or in a run where every node was healthy.
+    What separates them is the whole shape at once: the denied node's health
+    never answered, that node never finished its readiness exchange, every
+    other node's did, and the run was still rejected. Any one of those on its
+    own is satisfied by a harness that ignores readiness entirely.
+    """
+    readiness = report.get("readiness", {})
+    completed = readiness.get("ready", [])
+    faulted = readiness.get("last_http_results", {}).get(str(index))
+    return (
+        faulted is not None
+        and faulted != HEALTH_OK
+        and str(index) not in completed
+        and len(completed) == count - 1
+    )
+
+
+def run_negative_control(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
+    """Deny one node its health endpoint and require the run to be rejected.
+
+    The run is the ordinary one, unmodified, with one node's health forward
+    withheld at launch: the readiness loop, the SSH data exchange and the HTTP
+    check are the ones every other run uses, and the failure is theirs. The
+    control's own verdict is whether that run was rejected for that node and
+    no other, computed from the readings the run published rather than from
+    the presence of an error message, so a run that failed for some other
+    reason is a control that did not detect anything.
+    """
+    index = args.negative_control_vm
+    try:
+        execute_benchmark(args, run_dir)
+    except BenchmarkFailed as failure:
+        report = failure.report
+    except HarnessError as error:
+        # A run that failed outside the phases that publish a report is still
+        # a run this control has a verdict about, and the record has to say so
+        # rather than leave the operator with an exit status alone.
+        report = {"error": str(error)}
+    else:
+        # A run that passed with a node denied readiness is a harness whose
+        # checks are not looking, and it has to be reported as the control
+        # failing rather than as a fast fleet.
+        report = {}
+    detected = bool(report) and control_detected(report, index=index, count=args.count)
+    readiness = report.get("readiness", {})
+    return {
+        "detected": detected,
+        # The fault, in the terms a reader can check against the launch that
+        # installed it: one node's health forward withheld, every other node
+        # forwarded and answering.
+        "fault": "health_forward_withheld",
+        "negative_control_vm": index,
+        "observation": {
+            "error": report.get("error", "the run was accepted"),
+            "last_http_results": readiness.get("last_http_results", {}),
+            "last_ssh_results": readiness.get("last_ssh_results", {}),
+            "ready": readiness.get("ready", []),
+        },
+        "status": "detected" if detected else "not_detected",
+        "statuses": {
+            "nodes_health_ready": len(readiness.get("http_ready", [])),
+            "nodes_ran": args.count,
+        },
+    }
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         run_dir = create_run_dir(args.tmpdir)
-        result = execute_benchmark(args, run_dir)
+        if args.negative_control_vm is None:
+            result = execute_benchmark(args, run_dir)
+        else:
+            control = run_negative_control(args, run_dir)
+    except BenchmarkFailed as error:
+        # On stdout, where the result of a passing run is printed and where
+        # the result file is read from: a run that measured the divergence it
+        # is failing on has to publish it, or the measurement is recoverable
+        # only by repeating the whole run.
+        sys.stdout.write(json.dumps(error.report, sort_keys=True) + "\n")
+        sys.stderr.write(f"fanout benchmark failed: {error}\n")
+        return 1
     except HarnessError as error:
         sys.stderr.write(f"fanout benchmark failed: {error}\n")
         return 1
     except KeyboardInterrupt:
         sys.stderr.write("fanout benchmark interrupted; child VMs were cleaned up\n")
         return 130
+
+    if args.negative_control_vm is not None:
+        sys.stdout.write(json.dumps(control, sort_keys=True) + "\n")
+        sys.stderr.write(
+            f"fanout negative control: readiness of VM {args.negative_control_vm} was "
+            f"{control['status']}\n"
+        )
+        return 0 if control["detected"] else 1
 
     sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
     return 0 if result["ready_within_target"] else 1

@@ -9,6 +9,10 @@ let
   guestSystems = {
     aarch64-darwin = "aarch64-linux";
     x86_64-linux = "x86_64-linux";
+    # The identity mapping, unlike aarch64-darwin above: an aarch64-linux
+    # host runs an aarch64-linux guest on its own architecture, with no
+    # emulation and no cross builder. The pdx-nxmm hosts are this case.
+    aarch64-linux = "aarch64-linux";
   };
   guestSystem =
     guestSystems.${hostSystem}

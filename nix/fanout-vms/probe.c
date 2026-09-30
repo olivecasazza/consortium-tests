@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -95,6 +96,70 @@ static int emit_entropy(long want)
     return 0;
 }
 
+/* Third mode: print the address the kernel has for an interface, now.
+ *
+ * The address belongs to the launch (guest_mac in bench.py), not to the
+ * image: all 64 nodes resume one captured snapshot, so no value the build
+ * knew can be right for them, and nothing is written at boot for the same
+ * reason. Reading sysfs per invocation is what makes the answer the device's
+ * own current state, and it is what a node has to consult to say which of the
+ * 64 it is -- one shared address would leave that unanswerable.
+ *
+ * FANOUT_SYSFS_NET is a build-time constant so the guest gets sysfs and a
+ * test can point this same source at a fixture tree. The address itself is
+ * never compiled in.
+ */
+#ifndef FANOUT_SYSFS_NET
+#define FANOUT_SYSFS_NET "/sys/class/net"
+#endif
+
+/* IFNAMSIZ is 16 including the NUL, so a name cannot be longer than this. */
+#define MAX_INTERFACE_NAME 15
+
+static int emit_link_address(const char *interface)
+{
+    if (interface[0] == '\0' || strlen(interface) > MAX_INTERFACE_NAME) {
+        fprintf(stderr, "interface name must be 1..%d characters\n", MAX_INTERFACE_NAME);
+        return -1;
+    }
+    /* The name becomes a path component, so only the characters the kernel
+     * allows in an interface name are taken. Anything else is a typo, or a
+     * request to read some other file. */
+    for (const char *c = interface; *c != '\0'; c++) {
+        if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_' && *c != '.') {
+            fprintf(stderr, "interface name %s is not an interface name\n", interface);
+            return -1;
+        }
+    }
+
+    char path[sizeof(FANOUT_SYSFS_NET) + MAX_INTERFACE_NAME + sizeof("/address")];
+    snprintf(path, sizeof(path), "%s/%s/address", FANOUT_SYSFS_NET, interface);
+
+    FILE *file = fopen(path, "r");
+    if (file == NULL) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    char line[64];
+    if (fgets(line, sizeof(line), file) == NULL) {
+        fprintf(stderr, "%s held no address\n", path);
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+
+    /* sysfs terminates the value with a newline; print the address alone, so
+     * the caller compares one line either way. */
+    line[strcspn(line, "\n")] = '\0';
+    if (line[0] == '\0') {
+        fprintf(stderr, "%s held an empty address\n", path);
+        return -1;
+    }
+    if (write_all(STDOUT_FILENO, line, strlen(line)) != 0)
+        return -1;
+    return write_all(STDOUT_FILENO, "\n", 1);
+}
+
 static int read_all(int fd, char **buf, size_t *len, size_t *cap)
 {
     for (;;) {
@@ -127,6 +192,9 @@ int main(int argc, char **argv)
     size_t len = 0, cap = 0;
     int rc = 1;
 
+    if (argc == 3 && strcmp(argv[1], "--address") == 0) {
+        return emit_link_address(argv[2]) == 0 ? 0 : 1;
+    }
     if (argc == 3 && strcmp(argv[1], "--entropy") == 0) {
         char *end = NULL;
         long want = strtol(argv[2], &end, 10);
@@ -143,7 +211,9 @@ int main(int argc, char **argv)
          * this, `--entropy` with no count falls through to the file branch,
          * creates a file by that name, and then blocks reading stdin. */
         fprintf(stderr, "usage: %s FILE\n"
-                        "       %s --entropy BYTES\n", argv[0], argv[0]);
+                        "       %s --entropy BYTES\n"
+                        "       %s --address INTERFACE\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *path = argv[1];

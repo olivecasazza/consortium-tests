@@ -8,7 +8,6 @@
 }:
 
 let
-  guestMac = "02:00:00:00:00:01";
   busyboxHttpd = pkgs.busybox.override {
     extraConfig = ''
       CONFIG_HTTPD y
@@ -56,7 +55,11 @@ in
       {
         type = "user";
         id = "net0";
-        mac = guestMac;
+        # No mac: bench.py gives every launch its own address with
+        # -global virtio-net-pci.mac=, because an explicit mac= here wins over
+        # it and would hand all 64 restored guests one address. A guest that
+        # left this to QEMU would fall back to the same 52:54:00:12:34:56
+        # anyway, so the harness has to be the one to say.
       }
     ];
     forwardPorts = [ ];
@@ -118,8 +121,27 @@ in
     ];
   };
 
+  # The address is per launch (see microvm.interfaces), so it cannot be a
+  # stable match: a .network keyed on a MAC would stop matching the moment
+  # bench.py hands this VM its own, and the guest would lose DHCP. The name is
+  # pinned here instead of left to the kernel, which derives it from PCI slot
+  # order, so the name is the same in the captured guest and in all 64
+  # restores. The match is on device type and on ID_BUS, a udev property the
+  # kernel emits when the device is registered, because this is a stage-1
+  # rename: the driver need not be bound yet, and the address, the one
+  # property that is certain, differs per launch. Property= is the [Match] key
+  # that reads a udev property; there is no Bus= key to use instead. There is
+  # exactly one NIC.
+  systemd.network.links."10-fanout" = {
+    matchConfig = {
+      Type = "ether";
+      Property = "ID_BUS=pci";
+    };
+    linkConfig.Name = "net0";
+  };
+
   systemd.network.networks."10-user" = {
-    matchConfig.MACAddress = guestMac;
+    matchConfig.Name = "net0";
     networkConfig = {
       DHCP = "ipv4";
       IPv6AcceptRA = false;

@@ -106,6 +106,18 @@ commit; the defaults are this checkout and `BASE_REV` below. The Apple leg
 needs the aarch64-linux builder, `nix/fanout-vms/linux-builder.nix`, which the
 driver names if it is not listening on `:31022`.
 
+`FANOUT_LINUX_HOST` and `FANOUT_LINUX_SYSTEM` name the target of the Linux leg,
+and the fleet spans two architectures: `pdx-nxst-001`/`-003` are `x86_64-linux`
+and `pdx-nxmm-01`/`-02`/`-03` are `aarch64-linux`. A system the flake does not
+build for is refused before the build rather than built for and pushed to a
+host that cannot run it, so the two are set together:
+
+```sh
+FANOUT_LINUX_HOST=root@pdx-nxmm-01.schrodinger.com \
+FANOUT_LINUX_SYSTEM=aarch64-linux \
+FANOUT_PLATFORMS=linux nix/fanout-vms/run.sh
+```
+
 There is no copy of the harness in any other repo, and there should not be:
 harness and driver both live here.
 

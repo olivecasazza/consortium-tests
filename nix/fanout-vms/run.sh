@@ -29,11 +29,34 @@ DEADLINE=${FANOUT_STARTUP_DEADLINE:-600}
 REPS=${FANOUT_REPS:-3}
 PLATFORMS=${FANOUT_PLATFORMS:-linux apple}
 LINUX_HOST=${FANOUT_LINUX_HOST:-root@pdx-nxst-001.schrodinger.com}
+# Which packages.<system>.fanout64 the Linux leg asks for. The fleet spans two
+# architectures - pdx-nxst-001 and -003 are x86_64, pdx-nxmm-01/-02/-03 are
+# aarch64 - so it cannot be derived from a default host: pointing
+# FANOUT_LINUX_HOST at one family without this would build the other family's
+# closure and push it to a machine that cannot run it. The default is the
+# system of the default host; a host of another system needs this set to match
+# it, deliberately. Expanded with - and not with :- so that setting the
+# variable to nothing is refused as the bad request it is, rather than
+# silently taken as the default.
+LINUX_SYSTEM=${FANOUT_LINUX_SYSTEM-x86_64-linux}
+# The Linux systems the flake builds fanout64 for, in flake.nix's own order,
+# and one list so the message and the check cannot name different sets. Only
+# the Linux leg is per-host: the Apple leg runs on this machine, where
+# guestSystems already maps aarch64-darwin to its guest, so it has nothing to
+# ask for.
+LINUX_SYSTEMS="aarch64-linux x86_64-linux"
 WORK=${FANOUT_WORK:-$HOME/.cache/fanout64-harness}
 # One cold-boot rep per platform, outside the median, as the anchor the warm
 # headline is read against. Set FANOUT_COLD_CONTROL=0 to skip it: cold boot is
 # far slower than a restore, and it is reported, never gated.
 COLD_CONTROL=${FANOUT_COLD_CONTROL:-1}
+# The readiness negative control: one node is denied its health endpoint on
+# purpose and the run has to be rejected for that node. Off unless asked for,
+# because the run it makes is supposed to fail. Read the verdict out of the
+# record rather than off the exit status: a crashed harness and a rejected
+# run both exit nonzero, and only the second is a control that passed.
+NEGATIVE_CONTROL=${FANOUT_NEGATIVE_CONTROL:-0}
+NEGATIVE_CONTROL_VM=${FANOUT_NEGATIVE_CONTROL_VM:-1}
 MAX_AMBIENT_LOAD=${FANOUT_MAX_AMBIENT_LOAD:-25}
 # aarch64-linux builder for the Apple guests (nix/fanout-vms/linux-builder.nix).
 BUILDER_KEY=/etc/nix/builder_ed25519
@@ -42,6 +65,18 @@ BUILDER_CORES=${FANOUT_BUILDER_CORES:-12}
 
 log() { printf '[fanout64] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+(( NEGATIVE_CONTROL_VM >= 1 && NEGATIVE_CONTROL_VM <= COUNT )) ||
+  die "FANOUT_NEGATIVE_CONTROL_VM must name a node of the fleet: between 1 and $COUNT"
+
+# Before nix is reached, not after. A wrong system does not fail the build, it
+# produces a closure of the wrong architecture that a remote --store hands to
+# the target host as if it belonged there. The spaces pad both sides so the
+# match is a whole name: "x86_64" is not "x86_64-linux", and a request that is
+# not in the list at all matches nothing.
+[[ " $LINUX_SYSTEMS " == *" $LINUX_SYSTEM "* ]] ||
+  die "FANOUT_LINUX_SYSTEM must name a system this flake builds fanout64 for:" \
+    "asked for '$LINUX_SYSTEM', supported: $LINUX_SYSTEMS"
 
 # Record the host's 1-minute load average for one Apple rep, appended to the
 # series. Sampled per rep, not once before the fleet: measured on this host, a
@@ -81,10 +116,10 @@ results=$WORK/results/run-$(date +%s)
 mkdir -p "$results"
 
 run_linux() {
-  log "linux: building on ${LINUX_HOST#*@}"
+  log "linux: building $LINUX_SYSTEM on ${LINUX_HOST#*@}"
   local out
   out=$(nix build --no-link --print-out-paths --eval-store auto \
-    --store "ssh-ng://$LINUX_HOST" "path:$stage#packages.x86_64-linux.fanout64" 2>"$results/linux-build.log" | tail -1) ||
+    --store "ssh-ng://$LINUX_HOST" "path:$stage#packages.${LINUX_SYSTEM}.fanout64" 2>"$results/linux-build.log" | tail -1) ||
     { tail -20 "$results/linux-build.log" >&2; die "linux build failed"; }
   [[ -n $out ]] || die "linux build produced no output path"
   for i in $(seq 1 "$REPS"); do
@@ -97,6 +132,31 @@ run_linux() {
     ssh -o BatchMode=yes "$LINUX_HOST" "TMPDIR=/var/tmp $out/bin/fanout64 --count $COUNT --startup-deadline $DEADLINE --boot cold" \
       >"$results/linux-cold.json" 2>"$results/linux-cold.err" || true
   fi
+  if [[ $NEGATIVE_CONTROL == 1 ]]; then
+    negative_control linux ssh -o BatchMode=yes "$LINUX_HOST" \
+      env TMPDIR=/var/tmp "$out/bin/fanout64" --count "$COUNT" --startup-deadline "$DEADLINE"
+  fi
+}
+
+negative_control() {
+  # The command is passed as words rather than as one remote string because
+  # the harness flag has to reach the harness: ssh would read it as another
+  # argument to itself if it were appended to a single quoted string.
+  local name=$1
+  shift
+  log "$name: readiness negative control (VM $NEGATIVE_CONTROL_VM, a rejected run is expected)"
+  if "$@" --negative-control-vm "$NEGATIVE_CONTROL_VM" \
+    >"$results/$name-negative-control.json" 2>"$results/$name-negative-control.err"; then
+    cat "$results/$name-negative-control.json" >&2
+    die "$name negative control: a run with VM $NEGATIVE_CONTROL_VM denied readiness was accepted"
+  fi
+  python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));ok=r.get("status")=="detected" and r.get("negative_control_vm")==int(sys.argv[2]);sys.exit(0 if ok else 1)' \
+    "$results/$name-negative-control.json" "$NEGATIVE_CONTROL_VM" ||
+    {
+      cat "$results/$name-negative-control.json" >&2
+      die "$name negative control: the run was not rejected for VM $NEGATIVE_CONTROL_VM"
+    }
+  log "$name: negative control rejected the run for VM $NEGATIVE_CONTROL_VM"
 }
 
 run_apple() {
@@ -127,6 +187,10 @@ run_apple() {
     log "apple: cold-boot control ($out)"
     TMPDIR=$WORK/tmp "$out/bin/fanout64" --count "$COUNT" --startup-deadline "$DEADLINE" --boot cold \
       >"$results/apple-cold.json" 2>"$results/apple-cold.err" || true
+  fi
+  if [[ $NEGATIVE_CONTROL == 1 ]]; then
+    negative_control apple env TMPDIR="$WORK/tmp" "$out/bin/fanout64" \
+      --count "$COUNT" --startup-deadline "$DEADLINE"
   fi
 }
 
@@ -162,12 +226,16 @@ for p in platforms:
         # entropy_isolation_verified is the one it cannot see: a guest drawing
         # the same bytes as its neighbours is not a cross-node write leak, so
         # every other field would stay green.
+        # node_identity_verified is the per-launch NIC address reaching the
+        # guests: without it the 64 restored nodes can all answer to one
+        # address and every field above would still be green.
         ok = (r is not None and r.get("count") == count
               and r.get("ready_within_target") is True
               and s.get("ssh_ready") == count and s.get("http_ready") == count
               and s.get("ssh_data_exchange_verified") == count
               and s.get("state_isolation_verified") == count
               and s.get("entropy_isolation_verified") == count
+              and s.get("node_identity_verified") == count
               and s.get("store_paths_verified") == count
               and s.get("payload_executions_verified") == count)
         if not ok:
@@ -248,9 +316,15 @@ for p in platforms:
                 and s.get("ssh_data_exchange_verified") == count
                 and s.get("state_isolation_verified") == count
                 and s.get("entropy_isolation_verified") == count
+                and s.get("node_identity_verified") == count
                 and s.get("payload_executions_verified") == count)
     print(f"METRIC {p}_cold_control={'ok' if complete else 'incomplete'}")
-    print(f"METRIC {p}_cold_boot_readiness_s={r['readiness_s']:.3f}")
+    # A run that failed publishes what it measured, so a result file can hold
+    # a report with no timings in it: the control is then incomplete and its
+    # readiness is absent, not zero and not a crash of this script.
+    cold_readiness = r.get("readiness_s")
+    if cold_readiness is not None:
+        print(f"METRIC {p}_cold_boot_readiness_s={cold_readiness:.3f}")
 for note in degraded:
     print(f"[fanout64] DEGRADED {note}", file=sys.stderr)
 if failed:
