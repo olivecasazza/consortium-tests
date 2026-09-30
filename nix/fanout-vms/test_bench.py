@@ -8,13 +8,16 @@ import builtins
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import http.server
 import importlib.util
 import io
+import inspect
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -563,11 +566,13 @@ class PerVmGuestAddressTest(unittest.TestCase):
     """Every launch answers to its own NIC address.
 
     Nothing in a restored guest is written per VM: 64 of them resume one
-    captured snapshot, so the address cannot be burned into the image, and
-    fw_cfg is read only at boot, which a restore never reaches. The address is
-    a property of the launch instead, and the guest reads it back from the
-    device, so a single shared address leaves 64 nodes unable to tell which
-    one they are.
+    captured snapshot, and fw_cfg is read only at boot, which a restore never
+    reaches. The image does carry a mac, because microvm.nix declares the
+    option with no default and refuses to evaluate without one, but that value
+    is the capture guest's and would be every restored node's. The address is
+    a property of the launch instead, programmed onto the device over QMP, and
+    the guest reads it back, so a single shared address leaves 64 nodes unable
+    to tell which one they are.
     """
 
     def test_two_vms_do_not_answer_to_the_same_address(self) -> None:
@@ -597,11 +602,12 @@ class PerVmGuestAddressTest(unittest.TestCase):
     def test_a_vm_keeps_its_address_across_launches(self) -> None:
         # The address is derived from the index, not drawn at random: a fresh
         # fleet run has to reach the same guest, and the capture VM has to keep
-        # the address its snapshot was taken with.
+        # the address its snapshot was taken with. It is programmed onto the
+        # device per launch, so what has to hold is that the derivation is
+        # stable and that it is the one the image does not carry.
         self.assertEqual(bench.guest_mac(7), bench.guest_mac(7))
-        self.assertEqual(
-            ["-global", "virtio-net-pci.mac=02:00:00:00:00:07"], bench.guest_mac_args(7)
-        )
+        self.assertEqual(bench.guest_mac(1), bench.IMAGE_GUEST_MAC)
+        self.assertNotEqual(bench.guest_mac(7), bench.IMAGE_GUEST_MAC)
 
     def test_the_index_is_carried_in_the_low_octets(self) -> None:
         first = bench.guest_mac(1).split(":")
@@ -615,9 +621,14 @@ class PerVmGuestAddressTest(unittest.TestCase):
                 bench.guest_mac(index)
 
     def test_each_vm_is_launched_with_its_own_address(self) -> None:
-        # The address is per launch, so it has to reach QEMU per launch: one
-        # argv built outside the loop is one address for the whole fleet, and
-        # nothing downstream can tell that apart from a hardcoded MAC.
+        # The address cannot travel on the command line: an explicit mac= on
+        # the -device line outranks a -global virtio-net-pci.mac=, and the image
+        # has to carry one for microvm.nix to evaluate. So the argv must NOT
+        # carry a per-VM address, and every launch must instead be held at reset
+        # with -S, which is what lets bring_up_vm program the address before the
+        # guest's kernel probes the device and caches one. A launch without -S
+        # runs, probes, and caches the image's address, and no QMP write
+        # afterwards reaches what the guest already believes.
         launched: list[list[str]] = []
 
         class RunningRunner:
@@ -645,18 +656,26 @@ class PerVmGuestAddressTest(unittest.TestCase):
                 vm.log.close()
 
         self.assertEqual(2, len(launched))
-        self.assertEqual(["-global", "virtio-net-pci.mac=02:00:00:00:00:01"], launched[0][-2:])
-        self.assertEqual(["-global", "virtio-net-pci.mac=02:00:00:00:00:02"], launched[1][-2:])
+        for argv in launched:
+            self.assertIn("-S", argv)
+            # The failure this guards against is an argv carrying an address
+            # the image's explicit mac= silently outranks: it looks correct
+            # here and leaves all 64 restored nodes on one address.
+            self.assertEqual(
+                [], [a for a in argv if a.startswith("virtio-net-pci.mac=")]
+            )
 
 
     def test_every_restored_vm_is_launched_with_its_own_address(self) -> None:
         # The branch the fleet actually takes. All 64 nodes resume one captured
-        # snapshot, so the restore argv is where a per-launch address has to
-        # arrive, and two VMs without a snapshot exercise only the cold-boot
-        # branch the benchmark never measures. Uniqueness is checked across
-        # the whole fleet, because the failure this guards against is 63 of 64
-        # launches quietly agreeing with their neighbour.
+        # snapshot, so the restore argv is shared by every launch and the
+        # per-launch address has to arrive some other way: each child is given
+        # its own in the environment, and the runner substitutes it into the
+        # NIC's -device line. Uniqueness is checked across the whole fleet,
+        # because the failure this guards against is 63 of 64 launches quietly
+        # agreeing with their neighbour.
         launched: list[list[str]] = []
+        environments: list[dict[str, str]] = []
 
         class RunningRunner:
             """A runner that stays up, so launch_vms keeps the VM it started."""
@@ -670,6 +689,7 @@ class PerVmGuestAddressTest(unittest.TestCase):
 
         def record(argv: list[str], **kwargs: object) -> RunningRunner:
             launched.append(list(argv))
+            environments.append(dict(kwargs["env"]))  # type: ignore[arg-type]
             return RunningRunner()
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -696,35 +716,61 @@ class PerVmGuestAddressTest(unittest.TestCase):
                 vm.log.close()
 
         self.assertEqual(bench.MAX_VM_COUNT, len(launched))
-        carried: list[str] = []
         for index, argv in enumerate(launched, start=1):
             with self.subTest(vm=index):
-                # Read the address back out of the argv this launch really
-                # carried, so uniqueness is a statement about the launches and
-                # not a second computation of what they should have said.
-                addresses = [
-                    argument
-                    for argument in argv
-                    if argument.startswith("virtio-net-pci.mac=")
-                ]
-                self.assertEqual(
-                    [f"virtio-net-pci.mac={bench.guest_mac(index)}"], addresses
-                )
-                # The restore itself is still on the same argv: an address
-                # that arrived by displacing the incoming state would restore
-                # nothing.
+                # The restore itself is still on the argv, and the launch is
+                # still held at reset, so no guest can run before the device
+                # exists with the address this launch named.
                 self.assertIn("-incoming", argv)
                 self.assertIn("defer", argv)
+                self.assertIn("-S", argv)
                 # Restores map the captured RAM private, not shared.
                 self.assertTrue(
                     any("share=off" in argument for argument in argv),
                     f"restore argv does not map the captured RAM private: {argv}",
                 )
-            carried.extend(addresses)
-        self.assertEqual(bench.MAX_VM_COUNT, len(set(carried)))
+                # No address on the shared argv: the image's own mac= on the
+                # -device line outranks one, so it would be inert here and the
+                # shared image address would reach all 64 restored nodes.
+                self.assertEqual([], [a for a in argv if re.search(r"mac=", a, re.IGNORECASE)])
+                # Each VM's own TMPDIR, so a restore's writes cannot collide.
+                self.assertEqual(
+                    environments[index - 1]["TMPDIR"],
+                    str(run_dir / f"vm{index}"),
+                )
+
+        # The addresses the launches actually carried, read out of the child
+        # environments, so uniqueness is a statement about what the harness
+        # does and not a second computation of what it should do.
+        launched_addresses = [
+            environment[bench.QMP_NIC_MAC_ENV] for environment in environments
+        ]
+        self.assertEqual(
+            [bench.guest_mac(index) for index in range(1, bench.MAX_VM_COUNT + 1)],
+            launched_addresses,
+        )
+        self.assertEqual(bench.MAX_VM_COUNT, len(set(launched_addresses)))
+
+    def _bring_up(self, index: int) -> tuple[Any, Any]:
+        """Bring one VM up against a QMP connection, and return it and the VM."""
+        qmp = FakeQmp(mac=bench.IMAGE_GUEST_MAC)
+        vm = vm_process(index)
+        with (
+            mock.patch.object(bench, "connect_qmp", return_value=closed_socket()),
+            mock.patch.object(bench, "QmpConnection", return_value=qmp),
+        ):
+            bench.bring_up_vm(
+                vm,
+                bench.PortReservation(closed_socket(), closed_socket()),
+                10.0,
+                bench.Snapshot(Path("/tmp/ram"), 512, Path("/tmp/state"), Path("/tmp/ov")),
+            )
+        return qmp, vm
 
 
 GUEST_NIX_PATH = Path(__file__).with_name("guest.nix")
+RUNNER_NIX_PATH = Path(__file__).with_name("default.nix")
+
 
 
 def nix_block(text: str, opening: str, closing: str) -> str:
@@ -764,13 +810,21 @@ SYSTEMD_LINK_MATCH_KEYS = {
 
 
 class GuestImageAddressContractTest(unittest.TestCase):
-    """The guest must not pin the address the harness sets on every launch.
+    """The guest's networking must satisfy microvm.nix and still defer to QMP.
 
-    An explicit mac= on the interface beats the -global bench.py passes, so a
-    hardcoded address in the image puts all 64 restored guests back on one. And
-    a .network that matches a MAC stops matching the moment a VM is given its
-    own, which costs that guest its DHCP address and its readiness: 64 VMs
-    that never come up look exactly like a slow fleet.
+    microvm.nix declares interfaces[].mac with no default and destructures it
+    when it builds the -device line, so an interface that omits it fails
+    evaluation outright: the module never builds, and every package that
+    depends on the guest closure fails with it. That is a build failure, and
+    the pure-Python tests here cannot see it, which is why the gate below
+    reads the nix as text and asserts the contract directly.
+
+    The value the image carries is the capture guest's, and every launch names
+    its own, so the image's address is never what a restored node answers to.
+    The guest's own match must therefore stay off the address: a .network
+    keyed on a MAC stops matching the moment a VM is given its own, which
+    costs that guest its DHCP address and its readiness, and 64 VMs that never
+    come up look exactly like a slow fleet.
     """
 
     def setUp(self) -> None:
@@ -782,12 +836,76 @@ class GuestImageAddressContractTest(unittest.TestCase):
         self.link = nix_block(
             self.guest_nix, '  systemd.network.links."10-fanout" = {', r"\n  \};"
         )
+        # The runner is where the image's mac is replaced by the launch's, so
+        # the substitution is asserted against its own text.
+        self.runner_build = RUNNER_NIX_PATH.read_text(encoding="utf-8")
+        # A real launch's argv, captured from launch_vms itself so the
+        # assertion about it cannot drift from what a launch passes.
+        vms: list[Any] = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_dir = Path(temporary_directory) / "run"
+            run_dir.mkdir()
+            with mock.patch.object(bench.subprocess, "Popen") as popen:
+                popen.return_value.poll.return_value = None
+                bench.launch_vms(Path("/nonexistent/runner"), run_dir, 1, vms)
+                self.launch_argv = list(popen.call_args[0][0])
+                self.launch_env = dict(popen.call_args.kwargs["env"])
+        for vm in vms:
+            vm.log.close()
 
-    def test_the_interface_leaves_its_address_to_the_harness(self) -> None:
-        self.assertNotRegex(self.interfaces, r"(?m)^\s*mac\s*=")
+    def test_every_interface_sets_the_mac_microvm_nix_requires(self) -> None:
+        # The gate that was missing: microvm.nix has no default for mac and
+        # reads it in a destructuring pattern, so an interface without one
+        # raises during evaluation and takes the whole guest closure with it.
+        # The build itself is the real proof, but nothing in this suite
+        # evaluates nix, so the contract is asserted here against the text.
+        entries = re.findall(r"(?ms)^\s*\{\n(.*?)^\s*\}$", self.interfaces.strip())
+        self.assertTrue(entries, "no interface entry found to check")
+        for entry in entries:
+            with self.subTest(entry=entry.strip()[:40]):
+                self.assertRegex(entry, r"(?m)^\s*mac\s*=")
 
-    def test_the_network_no_longer_matches_on_an_address(self) -> None:
+    def test_the_image_carries_the_capture_guest_s_address(self) -> None:
+        # microvm.nix needs a value, and the capture guest is VM 1, so the
+        # image's address is VM 1's: that is what keeps the capture booting
+        # on the address its snapshot is read back under. A different value
+        # would put the capture on an address no launch ever programs, and
+        # the snapshot would be captured on an address that is then never
+        # read back as the device's.
+        self.assertRegex(
+            self.interfaces, rf'(?m)^\s*mac\s*=\s*"{re.escape(bench.IMAGE_GUEST_MAC)}";'
+        )
+
+    def test_the_harness_overrides_the_image_s_address_per_launch(self) -> None:
+        # The other half of the contract: a mac in the image is inert on its
+        # own, because microvm.nix writes it straight into the NIC's -device
+        # line and an explicit mac= there outranks anything a launch passes.
+        # The per-VM address therefore has to replace the image's on that same
+        # line, which the runner does by substituting an environment variable
+        # into it (default.nix). It cannot be written over QMP afterwards: a
+        # -device is realized while QEMU builds the machine, before the
+        # monitor is reachable, and a realized device's properties are
+        # read-only. Without the substitution the image's single address
+        # reaches all 64 restored nodes.
+        self.assertIn("-S", inspect.getsource(bench.launch_vms))
+        # The address this launch actually handed its child, read out of the
+        # launch rather than out of the source, so a change that moved the
+        # assignment would fail here instead of passing on a matched string.
+        self.assertEqual(bench.guest_mac(1), self.launch_env[bench.QMP_NIC_MAC_ENV])
+        # The runner's own line is where the substitution has to happen, and
+        # this is what would catch an inert -global creeping back in.
+        self.assertIn(bench.QMP_NIC_MAC_ENV, self.runner_build)
+        # Nothing per-VM on the shared argv: the value that differs per VM
+        # travels in the child's environment, and an address here would be
+        # outranked by the image's own mac= on the -device line anyway.
+        self.assertEqual([], [a for a in self.launch_argv if re.search(r"mac=", a, re.IGNORECASE)])
+
+    def test_the_network_does_not_match_the_address_the_image_carries(self) -> None:
+        # The coherence check: the address in the image is now a real value a
+        # launch can differ from, so a match pinned to it would be pinned to
+        # an address 63 of 64 nodes never hold.
         self.assertNotIn("MACAddress", self.network)
+        self.assertNotIn(bench.IMAGE_GUEST_MAC, self.network)
 
     def test_the_network_matches_the_name_and_still_asks_for_dhcp(self) -> None:
         self.assertIn('matchConfig.Name = "net0";', self.network)
@@ -852,34 +970,94 @@ def closed_socket() -> socket.socket:
     return mock.MagicMock(spec=socket.socket)
 
 
+# The machine tree a real launch of the built runner presents, trimmed to what
+# the NIC lookup reads. Measured against the runner held at -S: the NIC is
+# anonymous, because the runner's -device carries no id=, and QEMU parents it
+# in the anonymous container as device[3]; the named container holds nothing
+# but the property "type", and unattached holds machine devices and no NIC.
+# The machine's own listing mixes properties with children of three different
+# kinds, so only child<container> is a place a NIC can be.
+MACHINE_TREE: dict[str, list[dict[str, str]]] = {
+    bench.QMP_MACHINE_PATH: [
+        {"name": "type", "type": "string"},
+        {"name": "cxl_host_reg[0]", "type": "child<memory-region>"},
+        {"name": "peripheral-anon", "type": "child<container>"},
+        {"name": "fw_cfg", "type": "child<fw_cfg_mem>"},
+        {"name": "peripheral", "type": "child<container>"},
+        {"name": "unattached", "type": "child<container>"},
+        {"name": "virt.flash0", "type": "child<cfi.pflash01>"},
+    ],
+    "/machine/peripheral-anon": [
+        {"name": "type", "type": "string"},
+        {"name": "device[0]", "type": "child<virtio-rng-pci>"},
+        {"name": "device[1]", "type": "child<virtio-blk-pci>"},
+        {"name": "device[2]", "type": "child<virtio-blk-pci>"},
+        {"name": "device[3]", "type": "child<virtio-net-pci>"},
+    ],
+    "/machine/peripheral": [{"name": "type", "type": "string"}],
+    "/machine/unattached": [
+        {"name": "type", "type": "string"},
+        {"name": "device[2]", "type": "child<arm-gicv2m>"},
+        {"name": "device[3]", "type": "child<pl011>"},
+        {"name": "device[5]", "type": "child<gpex-pcihost>"},
+    ],
+}
+
+
+def machine_tree(**containers: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    """A copy of MACHINE_TREE with the named containers replaced."""
+    tree = {
+        path: [dict(entry) for entry in entries] for path, entries in MACHINE_TREE.items()
+    }
+    for name, entries in containers.items():
+        tree[f"{bench.QMP_MACHINE_PATH}/{name}"] = entries
+    return tree
+
+
+def nic_entries(*names: str) -> list[dict[str, str]]:
+    """A container holding NICs, under the index-derived names they get."""
+    return [
+        {"name": "type", "type": "string"},
+        *({"name": name, "type": "child<virtio-net-pci>"} for name in names),
+    ]
+
+
 class FakeQmp:
     """A QMP connection that records commands and answers the ones used here.
 
-    mac is what QEMU holds for the NIC, so a caller exercising bring_up_vm
-    has to pass the address that launch assigned (guest_mac of the VM's
-    index): the run refuses a device holding anything else, and an unset mac
-    fails it rather than passing a test on a placeholder.
+    mac is the address the device holds, which is what this launch named for
+    it: the runner puts that on the NIC as QEMU builds the machine, so a
+    caller exercising bring_up_vm reads back what its own launch programmed.
+    ignored models a device that did not take the address the launch named,
+    which is the state the run has to be able to refuse: a device left on the
+    image's shared address answers to the same address as its neighbours, and
+    nothing downstream of the read would tell that apart from a fleet of
+    distinct nodes.
     """
 
     def __init__(
         self,
         *,
-        peripherals: list[dict[str, str]] | None = None,
+        tree: dict[str, list[dict[str, str]]] | None = None,
         mac: str | None = None,
+        ignored: bool = False,
     ) -> None:
-        self.peripherals = (
-            [
-                {"name": "i440FX", "type": "I440FX-pcihost"},
-                {"name": "net0", "type": "virtio-net-pci"},
-            ]
-            if peripherals is None
-            else peripherals
-        )
+        # qom-list answers per path, because a NIC is at a path in the machine
+        # and not in a single list this harness could ask for.
+        self.tree = MACHINE_TREE if tree is None else tree
         self.mac = mac
+        # A device that did not take the address holds the image's instead,
+        # which is every restored node's address when none is programmed.
+        self.mac = bench.IMAGE_GUEST_MAC if ignored else mac
         self.commands: list[str] = []
+        # Every path a qom-list asked about, in order.
+        self.listed: list[str] = []
         # The monitor command lines, which is where the host forwards a
         # bring-up installs are named.
         self.host_monitor: list[str] = []
+        # Every (path, property, value) a bring-up wrote, in order. A bring-up
+        # has nothing to write, so a non-empty list is itself the failure.
+        self.writes: list[tuple[str, str, str]] = []
 
     def negotiate(self, deadline: float) -> None:
         self.commands.append("qmp_capabilities")
@@ -895,7 +1073,18 @@ class FakeQmp:
         if command == "query-migrate":
             return {"status": "completed"}
         if command == "qom-list":
-            return self.peripherals
+            assert arguments is not None
+            self.listed.append(arguments["path"])
+            return self.tree.get(arguments["path"], [])
+        if command == "qom-set":
+            # A realized device's properties are read-only, so a bring-up that
+            # tried to write here would be refused by a real QEMU. Recording
+            # the attempt makes that visible as a failure of these tests.
+            assert arguments is not None
+            self.writes.append(
+                (arguments["path"], arguments["property"], arguments["value"])
+            )
+            return None
         if command == "qom-get":
             assert arguments is not None
             self.queried = (arguments["path"], arguments["property"])
@@ -952,30 +1141,97 @@ class NicAddressOverQmpTest(unittest.TestCase):
         # The runner does not name the NIC, so a harness that looked for a
         # known id would fail on a machine that happens to number it
         # differently. The type is what distinguishes it from every other
-        # peripheral.
+        # peripheral, and the container it lands in is the machine's to say.
         qmp = FakeQmp()
         path = bench.find_nic_qom_path(qmp, 1, 0.0)
-        self.assertEqual(f"{bench.QMP_PERIPHERAL_PATH}/net0", path)
+        self.assertEqual("/machine/peripheral-anon/device[3]", path)
+        # Every container that can hold a device is searched, and nothing
+        # outside one is: the machine's own listing carries children of three
+        # kinds, and only a container can hold a NIC.
+        self.assertEqual(
+            [
+                bench.QMP_MACHINE_PATH,
+                "/machine/peripheral-anon",
+                "/machine/peripheral",
+                "/machine/unattached",
+            ],
+            qmp.listed,
+        )
+
+    def test_the_named_container_is_searched_too(self) -> None:
+        # A runner that did name its device would parent it in the named
+        # container, so a lookup that only walked the anonymous one would
+        # refuse a machine that has a perfectly findable NIC in it. The
+        # anonymous container is emptied, because a machine with a NIC in both
+        # has two and is refused for that, not found.
+        qmp = FakeQmp(
+            tree=machine_tree(**{"peripheral-anon": [], "peripheral": nic_entries("net0")})
+        )
+        self.assertEqual(
+            "/machine/peripheral/net0", bench.find_nic_qom_path(qmp, 1, 0.0)
+        )
+
+    def test_a_property_is_never_mistaken_for_a_nic(self) -> None:
+        # Every container lists a property named "type", and qom-list reports
+        # a property as its own type while it reports a child as child<TYPE>.
+        # A filter that matched on a name, or that accepted any entry, would
+        # hand qom-set a path no device sits at.
+        listed_property = {"name": "type", "type": "string"}
+        nic = {"name": "device[0]", "type": "child<virtio-net-pci>"}
+        for entry in (
+            listed_property,
+            {"name": "virtio-net", "type": "string"},
+            {"name": "device[1]", "type": "link<virtio-net-pci>"},
+            {"name": "device[2]", "type": "virtio-net-pci"},
+        ):
+            with self.subTest(entry=entry):
+                self.assertIsNone(bench.qom_child_type(entry))
+        # The property every container really lists does not make a second
+        # NIC, and is not the one selected.
+        qmp = FakeQmp(
+            tree=machine_tree(**{"peripheral-anon": [listed_property, nic]})
+        )
+        self.assertEqual(
+            "/machine/peripheral-anon/device[0]",
+            bench.find_nic_qom_path(qmp, 1, 0.0),
+        )
 
     def test_a_machine_without_exactly_one_nic_is_refused(self) -> None:
-        # Two NICs have no single address to report, and picking one would
-        # report an address the run never assigned to anything.
-        for peripherals in (
-            [],
-            [{"name": "i440FX", "type": "I440FX-pcihost"}],
-            [
-                {"name": "net0", "type": "virtio-net-pci"},
-                {"name": "net1", "type": "virtio-net-pci"},
-            ],
+        # No NIC has no address to report, and two NICs have no single answer:
+        # picking one would report an address the run never assigned to
+        # anything. Both counts are refused, from any container.
+        for containers in (
+            {"peripheral-anon": [], "peripheral": [], "unattached": []},
+            {"peripheral-anon": [{"name": "device[0]", "type": "child<virtio-blk-pci>"}]},
+            {"peripheral-anon": nic_entries("device[0]", "device[1]")},
+            {"peripheral-anon": nic_entries("device[0]"), "peripheral": nic_entries("net0")},
         ):
-            with self.subTest(peripherals=peripherals):
-                qmp = FakeQmp(peripherals=peripherals)
+            with self.subTest(containers=sorted(containers)):
+                qmp = FakeQmp(tree=machine_tree(**containers))
                 with self.assertRaisesRegex(bench.HarnessError, "expected one virtio-net NIC"):
                     bench.find_nic_qom_path(qmp, 1, 0.0)
 
-    def _bring_up(self, index: int, mac: str | None) -> tuple[Any, Any]:
-        """Run bring_up_vm for one VM against a QMP connection holding mac."""
-        qmp = FakeQmp(mac=mac)
+    def test_the_path_is_resolved_again_on_every_call(self) -> None:
+        # device[N] is an index into whichever container claimed the device, so
+        # it is a property of the launch. A lookup that remembered its answer
+        # would address the previous launch's device, which on a different
+        # launch is a blk or the absent index.
+        qmp = FakeQmp()
+        first = bench.find_nic_qom_path(qmp, 1, 0.0)
+        qmp.tree = machine_tree(**{"peripheral-anon": nic_entries("device[7]")})
+        self.assertEqual("/machine/peripheral-anon/device[7]", bench.find_nic_qom_path(qmp, 1, 0.0))
+        self.assertNotEqual(first, bench.find_nic_qom_path(qmp, 1, 0.0))
+
+    def _bring_up(self, index: int, *, ignored: bool = False) -> tuple[Any, Any]:
+        """Run bring_up_vm for one VM against a QMP connection.
+
+        The device holds the address this launch named for it, which is what
+        the runner puts on the NIC as QEMU builds the machine, so a pass here
+        is a statement about the launch and not about a write. ignored models a
+        device left on the image's address, which is what a launch whose
+        substitution did not take effect looks like.
+        """
+        qmp = FakeQmp(mac=bench.guest_mac(index), ignored=ignored)
         vm = vm_process(index)
         with (
             mock.patch.object(bench, "connect_qmp", return_value=closed_socket()),
@@ -989,36 +1245,47 @@ class NicAddressOverQmpTest(unittest.TestCase):
             )
         return qmp, vm
 
-    def test_the_address_is_read_after_cont_and_recorded(self) -> None:
-        # The read has to follow cont: before it, the restore has not landed
-        # and QEMU is describing the paused capture, not this VM. The address
-        # the device holds is the one this launch assigned VM 7, which is what
-        # the run requires of the device and therefore the only value a bring-up
-        # can pass with: a reading taken but never compared would let a device
-        # no launch ever addressed through, and 64 restored nodes answering to
-        # one address.
-        qmp, vm = self._bring_up(7, bench.guest_mac(7))
-        self.assertLess(
-            qmp.commands.index("cont"),
-            qmp.commands.index("qom-get"),
+    def test_the_address_is_read_from_the_device_after_cont_and_never_written(self) -> None:
+        # The read is the mechanism now. The launch names the address before
+        # the machine is built, so there is nothing to write over QMP: a
+        # -device is realized before the monitor is reachable, and a realized
+        # device's properties are read-only, so a write here would be refused.
+        # The read has to come after cont so it reports the running device
+        # rather than what this launch asked for, and the address it finds is
+        # the one this launch assigned VM 7, which is the only value a
+        # bring-up can pass with: a reading taken but never compared would let
+        # 64 restored nodes answer to one address.
+        qmp, vm = self._bring_up(7)
+        self.assertEqual([], qmp.writes)
+        # The lookup runs after the restore and the read after cont, so the
+        # address reported is the running device's, not the paused one's.
+        addressing = [
+            command
+            for command in qmp.commands
+            if command in ("qom-list", "qom-set", "cont", "qom-get")
+        ]
+        self.assertEqual(
+            ["qom-list", "qom-list", "qom-list", "qom-list", "cont", "qom-get"],
+            addressing,
         )
         self.assertEqual(bench.guest_mac(7), vm.device_address)
         self.assertEqual(
-            (f"{bench.QMP_PERIPHERAL_PATH}/net0", bench.QMP_NIC_MAC_PROPERTY),
+            ("/machine/peripheral-anon/device[3]", bench.QMP_NIC_MAC_PROPERTY),
             qmp.queried,
         )
 
-    def test_a_device_holding_another_address_fails_the_bring_up(self) -> None:
-        # The negative control for the host side. A device left on the
-        # capture-time address is what a restore with no per-launch injection
-        # looks like from QEMU, and it is indistinguishable fleet-wide from a
-        # device that was given one and a guest that misread it, so it has to
-        # be refused here rather than discovered 64 times over by the guests.
+    def test_a_device_that_did_not_take_the_address_fails_the_bring_up(self) -> None:
+        # The negative control for the host side. A device left on the image's
+        # shared address is what a launch whose per-launch substitution did not
+        # take effect looks like from QEMU, and it is indistinguishable
+        # fleet-wide from a device that was given one and a guest that misread
+        # it, so it has to be refused here rather than discovered 64 times over
+        # by the guests.
         with self.assertRaises(bench.HarnessError) as caught:
-            self._bring_up(7, bench.guest_mac(1))
+            self._bring_up(7, ignored=True)
         message = str(caught.exception)
         self.assertIn("VM 7", message)
-        self.assertIn(bench.guest_mac(1), message)
+        self.assertIn(bench.IMAGE_GUEST_MAC, message)
         self.assertIn(bench.guest_mac(7), message)
 
     def test_the_address_compared_is_this_launch_s_not_a_fixed_one(self) -> None:
@@ -1027,12 +1294,12 @@ class NicAddressOverQmpTest(unittest.TestCase):
         # only on VM 1.
         for index in (1, 2, 64):
             with self.subTest(index=index):
-                _, vm = self._bring_up(index, bench.guest_mac(index))
+                _, vm = self._bring_up(index)
                 self.assertEqual(bench.guest_mac(index), vm.device_address)
         for index in (2, 64):
             with self.subTest(index=index):
                 with self.assertRaises(bench.HarnessError):
-                    self._bring_up(index, bench.guest_mac(1))
+                    self._bring_up(index, ignored=True)
 
 
 class GuestReportsItsOwnAddressTest(unittest.TestCase):
@@ -1123,6 +1390,152 @@ class GuestReportsItsOwnAddressTest(unittest.TestCase):
             )
         remote = run.seen[0][-1]
         self.assertEqual(f"{PROBE_BINARY} --address {bench.GUEST_NIC_NAME}", remote)
+
+
+class ForwardQmp:
+    """A QMP connection answering the two forward commands a re-aim issues.
+
+    QEMU names the rule it removed and says nothing at all when an add worked,
+    so the two are answered differently here for the same reason: a re-aim that
+    treated the removal's confirmation as an error would never get to the add.
+    """
+
+    def __init__(self, removal_reply: str = "host forwarding rule removed") -> None:
+        self.removal_reply = removal_reply
+        self.host_monitor: list[str] = []
+
+    def negotiate(self, deadline: float) -> None:
+        pass
+
+    def execute(self, command: str, arguments: dict[str, Any], deadline: float) -> Any:
+        if command == "human-monitor-command":
+            line = arguments["command-line"]
+            self.host_monitor.append(line)
+            return self.removal_reply if line.startswith("hostfwd_remove") else ""
+        return None
+
+
+class GuestNicReprobeTest(unittest.TestCase):
+    """A restored guest has to re-probe its NIC before it can be asked who it is.
+
+    The kernel reads a NIC address when the driver probes the device and keeps
+    it in dev_addr from then on, and a restore carries the capture's state, so
+    every node would otherwise answer with the capture guest's address. Only a
+    re-probe re-reads the device's config space, and it costs the node its
+    lease: a new MAC is a new client to slirp's DHCP server, so the guest lands
+    on another address and the forward the host still has aimed at the old one
+    stops reaching it. That is what these steps are for.
+    """
+
+    def test_the_reprobe_is_addressed_by_device_name_and_reports_where_it_landed(self) -> None:
+        script = bench.guest_nic_reprobe_script(vm_process(7), 45678)
+        # sysfs addresses an unbind and a bind by the device's own name, and that
+        # name is only readable while the netdev is still there to read it from.
+        self.assertIn(f"readlink -f {bench.GUEST_NIC_DEVICE_PATH}", script)
+        self.assertLess(
+            script.index("/unbind"),
+            script.index("/bind"),
+        )
+        self.assertIn(f"{bench.VIRTIO_NET_DRIVER_PATH}/unbind", script)
+        self.assertIn(f"{bench.VIRTIO_NET_DRIVER_PATH}/bind", script)
+        # The report is the only way back from a node the host cannot reach, and
+        # it has to name its node as well as its address.
+        self.assertIn('"7 $IP"', script)
+        self.assertIn(f"{bench.GUEST_REPORT_GATEWAY} 45678", script)
+
+    def test_the_guest_waits_for_an_address_before_reporting_one(self) -> None:
+        # A report carrying no address would aim a forward at nothing.
+        script = bench.guest_nic_reprobe_script(vm_process(2), 45678)
+        self.assertLess(
+            script.index(f"ip -4 -o addr show {bench.GUEST_NIC_NAME}"),
+            script.index('echo "2 $IP"'),
+        )
+        self.assertIn('[ -n "$IP" ] && break', script)
+
+    def _collect(self, vms: Sequence[Any], payloads: Sequence[str], budget: float = 10.0) -> Any:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+
+        def send() -> None:
+            for payload in payloads:
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                    client.sendall(payload.encode())
+
+        thread = threading.Thread(target=send)
+        thread.start()
+        try:
+            return bench.collect_nic_reprobe_reports(
+                vms, listener, time.monotonic() + budget
+            )
+        finally:
+            thread.join()
+            listener.close()
+
+    def test_each_node_reports_the_address_it_lands_on(self) -> None:
+        vms = [vm_process(1), vm_process(2)]
+        self.assertEqual(
+            {1: "10.0.2.16", 2: "10.0.2.17"},
+            self._collect(vms, ["2 10.0.2.17", "1 10.0.2.16"]),
+        )
+
+    def test_a_report_naming_no_node_of_this_fleet_is_refused(self) -> None:
+        # A node that is not in the fleet would leave a forward aimed at nothing,
+        # and one that is would leave a real node's forward aimed at its address.
+        with self.assertRaises(bench.HarnessError):
+            self._collect([vm_process(1)], ["9 10.0.2.16"])
+
+    def test_a_node_that_never_reports_is_named_in_the_failure(self) -> None:
+        with self.assertRaises(bench.HarnessError) as caught:
+            self._collect([vm_process(1), vm_process(4)], ["1 10.0.2.16"], budget=0.2)
+        self.assertIn("4", str(caught.exception))
+
+    def test_the_forwards_are_re_aimed_at_the_reported_address(self) -> None:
+        qmp = ForwardQmp()
+        with (
+            mock.patch.object(bench, "connect_qmp", return_value=closed_socket()),
+            mock.patch.object(bench, "QmpConnection", return_value=qmp),
+        ):
+            bench.repoint_vm_forwards(vm_process(5), "10.0.2.16")
+        # Removed before added, because two rules on one host port is not a
+        # re-aim, and both ports: SSH for the identity read, health for readiness.
+        self.assertEqual(
+            [
+                f"hostfwd_remove net0 tcp:127.0.0.1:{bench.SSH_PORT_BASE + 5}",
+                f"hostfwd_add net0 tcp:127.0.0.1:{bench.SSH_PORT_BASE + 5}"
+                f"-10.0.2.16:{bench.GUEST_SSH_PORT}",
+                f"hostfwd_remove net0 tcp:127.0.0.1:{bench.HTTP_PORT_BASE + 5}",
+                f"hostfwd_add net0 tcp:127.0.0.1:{bench.HTTP_PORT_BASE + 5}"
+                f"-10.0.2.16:{bench.GUEST_HEALTH_PORT}",
+            ],
+            qmp.host_monitor,
+        )
+
+    def test_a_node_with_no_health_forward_gets_none_re_aimed(self) -> None:
+        # The negative control withholds a node's health forward on purpose;
+        # re-aiming would hand back the route the control removed.
+        qmp = ForwardQmp()
+        with (
+            mock.patch.object(bench, "connect_qmp", return_value=closed_socket()),
+            mock.patch.object(bench, "QmpConnection", return_value=qmp),
+        ):
+            bench.repoint_vm_forwards(vm_process(3, health_forwarded=False), "10.0.2.16")
+        self.assertEqual(
+            [line for line in qmp.host_monitor if "8080" in line],
+            [],
+        )
+
+    def test_a_forward_that_was_not_removed_is_refused(self) -> None:
+        # Adding beside the rule already on the port would leave the node with
+        # two, and the stale one is the one the host keeps using.
+        qmp = ForwardQmp(removal_reply="")
+        with (
+            mock.patch.object(bench, "connect_qmp", return_value=closed_socket()),
+            mock.patch.object(bench, "QmpConnection", return_value=qmp),
+            self.assertRaises(bench.HarnessError),
+        ):
+            bench.repoint_vm_forwards(vm_process(5), "10.0.2.16")
 
 
 class FailedRunPublishesItsMeasurementsTest(unittest.TestCase):
@@ -2065,6 +2478,462 @@ class PlatformMapAgreementTest(unittest.TestCase):
             with self.subTest(system=system):
                 self.assertIn(system, self.supported)
                 self.assertIn(system, self.guests)
+
+
+def _scratch_dir() -> str:
+    """A short parent for the launch directories, outside the source tree.
+
+    Darwin caps sun_path at 104 bytes, and the runner names its socket
+    fanout.qmp relative to its working directory, so a deep TemporaryDirectory
+    would leave a path no QMP client can connect to.
+    """
+    parent = Path(tempfile.gettempdir())
+    probe = parent / "fv-nic-0000000000" / bench.QMP_SOCKET_NAME
+    if len(os.fsencode(probe)) > bench.MAX_QMP_SOCKET_PATH_BYTES:
+        parent = Path("/tmp")
+    return str(parent)
+
+
+def _connect_qmp(workdir: Path, process: "subprocess.Popen[bytes]") -> socket.socket:
+    """The runner's QMP socket, waited for the way connect_qmp waits for one."""
+    deadline = time.monotonic() + 60.0
+    socket_path = workdir / bench.QMP_SOCKET_NAME
+    while True:
+        if process.poll() is not None:
+            raise AssertionError(
+                f"runner exited with status {process.returncode} before QMP was ready:\n"
+                f"{bench.read_log_tail(workdir / 'runner.log')}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"QMP socket {socket_path} never appeared:\n"
+                f"{bench.read_log_tail(workdir / 'runner.log')}"
+            )
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(min(0.2, remaining))
+        try:
+            connection.connect(str(socket_path))
+        except OSError:
+            connection.close()
+            time.sleep(0.01)
+        else:
+            return connection
+
+
+def _terminate(process: "subprocess.Popen[bytes]", workdir: Path) -> None:
+    """Signalling the whole session, so no QEMU outlives the test."""
+    if process.poll() is None:
+        for number, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
+            try:
+                os.killpg(process.pid, number)
+            except ProcessLookupError:
+                break
+            try:
+                process.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        else:
+            process.wait(timeout=10.0)
+    if bench.process_group_alive(process.pid):
+        raise AssertionError(
+            f"runner {process.pid} survived termination; log tail:\n"
+            f"{bench.read_log_tail(workdir / 'runner.log')}"
+        )
+
+
+# The runner, named from this source.
+#
+# /nix/store keeps every runner a rebuild has ever produced and gives them all
+# equal authority, so a scan finds the current one and each stale one beside
+# it, and there is no honest way to choose between them. Asking is exact: the
+# runner is the `runner` output of nix/fanout-vms, published as the
+# fanout64-guest package, so this flake names the store path its own source
+# builds. Evaluating that is a few seconds of Nix -- a benchmark invocation
+# should not pay it twice, so the answer is kept per source tree, and the
+# process memoizes it on top of that. Nothing here can realise a path: the
+# runner either is built or this reports why it is not.
+RUNNER_STORE_NAME = "fanout64-microvm-run"
+RUNNER_BINARY = "bin/microvm-run"
+FANOUT_GUEST_PACKAGE = "fanout64-guest"
+
+
+class RunnerResolutionFailure(Exception):
+    """Why this source could not name the runner it builds."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+    def message(self) -> str:
+        root = flake_root()
+        target = FANOUT_GUEST_PACKAGE
+        if root is not None:
+            target = f"packages.{host_system()}.{FANOUT_GUEST_PACKAGE}"
+        return (
+            f"this source cannot name the runner it builds: {self.reason}\n"
+            f"build it with `nix build {root or '.'}#{target}` -- the benchmark "
+            "does that for you -- or set FANOUT_MICROVM_RUN to a runner binary "
+            "to test that one instead. The NIC lookup was NOT exercised "
+            "against a real QEMU in this run."
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def flake_root() -> Path | None:
+    """The worktree this test file belongs to.
+
+    None when the file stands alone, which the checks.fanout-bench-test
+    sandbox arranges on purpose by copying nix/fanout-vms out of the tree.
+    That is the only case where the store scan is still the best answer
+    available, and it is the only case that falls back to it.
+
+    A flake.nix further up the filesystem does not count: /tmp holds copies of
+    this project, and one of those would answer for a source tree that is not
+    the one under test. The flake has to own the directory these tests are in.
+    """
+    here = Path(__file__).resolve().parent
+    for parent in here.parents:
+        if (parent / "flake.nix").is_file() and (
+            parent / "nix" / "fanout-vms"
+        ).resolve() == here:
+            return parent
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def host_system() -> str:
+    """The system whose packages this flake builds for."""
+    return _nix(["eval", "--impure", "--raw", "--expr", "builtins.currentSystem"])
+
+
+def _nix(arguments: Sequence[str]) -> str:
+    """Run nix and return its output, or say exactly why it could not be asked."""
+    try:
+        finished = subprocess.run(
+            ["nix", *arguments],
+            cwd=flake_root(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=True,
+        )
+    except FileNotFoundError as failure:
+        raise RunnerResolutionFailure("nix is not on PATH") from failure
+    except subprocess.TimeoutExpired as failure:
+        raise RunnerResolutionFailure(
+            f"`nix {' '.join(arguments)}` did not finish within 600s"
+        ) from failure
+    except subprocess.CalledProcessError as failure:
+        detail = (failure.stderr or failure.stdout).strip().splitlines()
+        raise RunnerResolutionFailure(
+            f"`nix {' '.join(arguments)}` failed: " + " | ".join(detail[-3:])
+        ) from failure
+    return finished.stdout.strip()
+
+
+def _source_key(root: Path) -> str:
+    """A digest of everything in this tree that decides the runner's path.
+
+    Only what the derivation is built from, which is the flake's own files and
+    the Nix and C sources under nix/fanout-vms. Bytecode caches and the test
+    module itself are excluded on purpose: they are rewritten by every run and
+    change no derivation, so hashing them would miss the cache every time.
+    """
+    digest = hashlib.sha256()
+    digest.update(host_system().encode())
+    sources = [
+        path
+        for path in (root / "flake.nix", root / "flake.lock")
+        if path.is_file()
+    ]
+    sources += sorted(
+        path
+        for path in (root / "nix" / "fanout-vms").rglob("*")
+        if path.is_file() and path.suffix in {".nix", ".c", ".h"}
+    )
+    for path in sources:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:32]
+
+
+def _cache_file(key: str) -> Path:
+    """Where the answer for this source tree is kept between runs."""
+    home = os.environ.get("XDG_CACHE_HOME") or os.environ.get("HOME")
+    base = Path(home) / ".cache" if home else Path(tempfile.gettempdir())
+    return base / "fanout64" / f"microvm-run-{key}"
+
+
+def _is_runner_directory(directory: str) -> bool:
+    return (
+        Path(directory).is_absolute()
+        and Path(directory).name.endswith(RUNNER_STORE_NAME)
+        and os.access(Path(directory) / RUNNER_BINARY, os.X_OK)
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def built_runner_directory() -> Path:
+    """The store path this source's flake builds its microVM runner into."""
+    root = flake_root()
+    if root is None:
+        raise RunnerResolutionFailure(
+            f"{Path(__file__).resolve()} is not inside a worktree with a "
+            "flake.nix, so nothing here can say which runner it builds"
+        )
+    key = _source_key(root)
+    remembered = _cache_file(key)
+    try:
+        cached = remembered.read_text().strip()
+    except OSError:
+        cached = ""
+    if _is_runner_directory(cached):
+        return Path(cached)
+    target = f"packages.{host_system()}.{FANOUT_GUEST_PACKAGE}"
+    # --no-write-lock-file: a test run has no business rewriting flake.lock.
+    named = _nix(["eval", "--raw", "--no-write-lock-file", f"{root}#{target}"])
+    if not _is_runner_directory(named):
+        if not Path(named).is_absolute():
+            raise RunnerResolutionFailure(
+                f"`{target}` evaluated to {named!r}, which is not a store path"
+            )
+        raise RunnerResolutionFailure(
+            f"this source builds {named}, but {named}/{RUNNER_BINARY} is missing "
+            "or not executable; the runner is not built here yet"
+        )
+    # A cache this suite cannot afford to rewrite, not a hard dependency: if
+    # the directory is unwritable the next run simply asks nix again.
+    with contextlib.suppress(OSError):
+        remembered.parent.mkdir(parents=True, exist_ok=True)
+        remembered.write_text(named + "\n")
+    return Path(named)
+
+
+def built_runner_binary() -> Path:
+    return built_runner_directory() / RUNNER_BINARY
+
+
+class RealRunnerNicLookupTest(unittest.TestCase):
+    """The NIC lookup, against a real QEMU the built runner actually starts.
+
+    The rest of this file reads the nix as text, so every other test can pass
+    over a QOM path that does not exist: a module that never evaluated and a
+    path naming a container QEMU never put a device in are both invisible to
+    them. This starts the built runner, holds it at -S so the guest never
+    runs, and asks its own QmpConnection where the device ended up, which is
+    the only way to see it.
+
+    It needs no fleet, no snapshot and no booted guest, so it costs a launch.
+    """
+
+    # The built runner, asked for rather than found: see built_runner_directory.
+    STORE_RUNNER_GLOB = "*-fanout64-microvm-run"
+
+    def _runner(self) -> Path:
+        override = os.environ.get("FANOUT_MICROVM_RUN")
+        if override:
+            runner = Path(override)
+            if not os.access(runner, os.X_OK):
+                raise AssertionError(
+                    f"FANOUT_MICROVM_RUN names {runner}, which is not executable"
+                )
+            return runner
+        if flake_root() is not None:
+            # The source can answer, so it must. A skip here would let a tree
+            # with a working flake stop testing the lookup without saying so.
+            try:
+                return built_runner_binary()
+            except RunnerResolutionFailure as failure:
+                raise AssertionError(failure.message()) from None
+        # No flake above this file, so the store is all there is. An executable
+        # one only: a build that failed still leaves its output path in the
+        # store, and picking that would fail the test for a reason that has
+        # nothing to do with the lookup.
+        built = sorted(
+            candidate
+            for candidate in Path("/nix/store").glob(
+                f"{self.STORE_RUNNER_GLOB}/{RUNNER_BINARY}"
+            )
+            if os.access(candidate, os.X_OK)
+        )
+        if not built:
+            raise unittest.SkipTest(
+                f"no built runner under /nix/store/{self.STORE_RUNNER_GLOB}: build "
+                "packages.aarch64-darwin.fanout64-guest first. The NIC lookup was "
+                "NOT exercised against a real QEMU in this run."
+            )
+        if len(built) > 1:
+            # Store mtimes are all normalized, so there is no honest way to say
+            # which of these the current source builds, and picking the wrong
+            # one reports a failure in the lookup that belongs to a stale
+            # guest. Naming them is the actionable answer.
+            raise AssertionError(
+                f"{len(built)} built runners are present and this store cannot "
+                "order them; set FANOUT_MICROVM_RUN to the one this source "
+                "builds:\n  "
+                + "\n  ".join(str(path) for path in built)
+            )
+        return built[0]
+
+    def _launch(self, runner: Path, *, vm_index: int = 1) -> socket.socket:
+        """Start the runner held at reset, and return a QMP connection to it.
+
+        The launch is made the way launch_vms makes it, including the address
+        in the child's environment, so what this exercises is the mechanism
+        the harness uses rather than a runner started some other way.
+
+        The working directory is a fresh temporary one: the runner writes its
+        overlay there and names its QMP socket relative to it, so two launches
+        sharing a directory would share both. The child gets its own session,
+        so the whole group can be signalled and nothing it started outlives
+        the test.
+        """
+        workdir = Path(tempfile.mkdtemp(prefix="fv-nic-", dir=_scratch_dir()))
+        self.addCleanup(shutil.rmtree, workdir, True)
+        log = (workdir / "runner.log").open("wb")
+        self.addCleanup(log.close)
+        process = subprocess.Popen(
+            [str(runner), "-S"],
+            cwd=workdir,
+            env=dict(
+                os.environ,
+                TMPDIR=str(workdir),
+                **{bench.QMP_NIC_MAC_ENV: bench.guest_mac(vm_index)},
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self.addCleanup(_terminate, process, workdir)
+        connection = _connect_qmp(workdir, process)
+        self.addCleanup(connection.close)
+        return connection
+
+    def _qmp(self, connection: socket.socket) -> bench.QmpConnection:
+        qmp = bench.QmpConnection(connection, 1)
+        qmp.negotiate(time.monotonic() + 60.0)
+        return qmp
+
+    def test_the_nic_is_found_and_its_address_read_from_a_real_qemu(self) -> None:
+        # The address the launch programmed is the one its own environment
+        # named, so this asserts the lookup found the device the launch
+        # created and that the address arrived. A path under the named
+        # container would name the property every container lists, and the read
+        # below would fail rather than return an address.
+        qmp = self._qmp(self._launch(self._runner(), vm_index=7))
+        deadline = time.monotonic() + 60.0
+
+        path = bench.find_nic_qom_path(qmp, 7, deadline)
+        container, _, name = path.rpartition("/")
+        self.assertIn(
+            container,
+            {
+                f"{bench.QMP_MACHINE_PATH}/peripheral-anon",
+                f"{bench.QMP_MACHINE_PATH}/peripheral",
+            },
+        )
+        # The name is index-derived, not one this harness chose.
+        self.assertRegex(name, r"^(device\[\d+\]|net0)$")
+
+        # The container really does list the property named "type", so the
+        # filter had to tell it from a device, and the NIC is the only
+        # virtio-net child among them.
+        listed = qmp.execute("qom-list", {"path": container}, deadline)
+        self.assertIn("type", [entry.get("name") for entry in listed])
+        self.assertIsNone(bench.qom_child_type({"name": "type", "type": "string"}))
+        self.assertEqual(
+            [name],
+            [
+                entry["name"]
+                for entry in listed
+                if (device_type := bench.qom_child_type(entry)) is not None
+                and bench.QMP_NIC_TYPE in device_type
+            ],
+        )
+
+        # The address is this launch's own, not the image's: a runner that
+        # ignored the environment would still answer with the image address
+        # and this would pass, which is the failure that leaves 64 restored
+        # nodes on one address.
+        self.assertEqual(
+            bench.guest_mac(7),
+            qmp.execute(
+                "qom-get",
+                {"path": path, "property": bench.QMP_NIC_MAC_PROPERTY},
+                deadline,
+            ),
+        )
+
+    def test_two_launches_of_one_runner_get_different_addresses(self) -> None:
+        # The image carries one address and every restore is a copy of it, so
+        # two launches of the same runner have to end up on different ones or
+        # the fleet shares a single identity. Nothing is written over QMP to
+        # make that happen: the address is on the device as QEMU builds the
+        # machine, and the harness's part is to name it per launch.
+        runner = self._runner()
+        deadline = time.monotonic() + 60.0
+        addresses = []
+        for index in (3, 4):
+            qmp = self._qmp(self._launch(runner, vm_index=index))
+            path = bench.find_nic_qom_path(qmp, index, deadline)
+            addresses.append(
+                qmp.execute(
+                    "qom-get",
+                    {"path": path, "property": bench.QMP_NIC_MAC_PROPERTY},
+                    deadline,
+                )
+            )
+        self.assertEqual([bench.guest_mac(3), bench.guest_mac(4)], addresses)
+
+    def test_two_launches_are_resolved_independently(self) -> None:
+        # Nothing may be remembered across launches. Two real machines are
+        # asked, each with its own QmpConnection, and a lookup that cached a
+        # path would answer the second from the first, where the same path is
+        # a different machine's device.
+        first = self._qmp(self._launch(self._runner()))
+        second = self._qmp(self._launch(self._runner()))
+        deadline = time.monotonic() + 60.0
+
+        for qmp in (first, second):
+            path = bench.find_nic_qom_path(qmp, 1, deadline)
+            self.assertEqual(
+                bench.IMAGE_GUEST_MAC,
+                qmp.execute(
+                    "qom-get",
+                    {"path": path, "property": bench.QMP_NIC_MAC_PROPERTY},
+                    deadline,
+                ),
+            )
+
+    def test_the_device_is_already_realized_so_a_qmp_write_cannot_land(self) -> None:
+        # Why the address is named before the guest runs and not written over
+        # QMP afterwards. QEMU realizes a -device at init, before the monitor
+        # is reachable, and a realized device's properties are read-only, so a
+        # qom-set of the address is refused by this QEMU. This states the
+        # constraint the mechanism has to satisfy rather than asserting a
+        # write works, which it does not.
+        qmp = self._qmp(self._launch(self._runner()))
+        deadline = time.monotonic() + 60.0
+
+        path = bench.find_nic_qom_path(qmp, 1, deadline)
+        self.assertTrue(
+            qmp.execute("qom-get", {"path": path, "property": "realized"}, deadline)
+        )
+        with self.assertRaises(bench.HarnessError) as caught:
+            qmp.execute(
+                "qom-set",
+                {
+                    "path": path,
+                    "property": bench.QMP_NIC_MAC_PROPERTY,
+                    "value": bench.guest_mac(2),
+                },
+                deadline,
+            )
+        self.assertIn("after it was realized", str(caught.exception))
+
 
 
 if __name__ == "__main__":

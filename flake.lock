@@ -12,17 +12,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1790450292,
-        "narHash": "sha256-ScutcZ8kjARagRZnQJa+6vdc2XYDzm0eSWNdg6gfTyw=",
-        "ref": "feat/fanout-vm-harness",
-        "rev": "850247da6ac4a09aa377fe96993126334304db34",
-        "revCount": 1049,
+        "lastModified": 1790743413,
+        "narHash": "sha256-zaaeep3P6ljUcU12wDGRoNtni8UTWPvdCAaUa8a8l58=",
+        "ref": "feat/cascade-copy-jsonl",
+        "rev": "98b99542536accb73b5234cca1f631d73eebd554",
+        "revCount": 1067,
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       },
       "original": {
-        "ref": "feat/fanout-vm-harness",
-        "rev": "850247da6ac4a09aa377fe96993126334304db34",
+        "ref": "feat/cascade-copy-jsonl",
+        "rev": "98b99542536accb73b5234cca1f631d73eebd554",
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       }

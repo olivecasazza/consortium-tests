@@ -76,14 +76,33 @@ OVERLAY_IMAGE_NAME = "overlay.img"
 # The three octets every per-VM address starts from: 0x02 is the
 # locally-administered bit, and the low bit of the address stays clear, so the
 # result is a unicast address the host network cannot already own. guest.nix
-# matches its network on the interface name, not on this, because the address
-# differs per launch.
+# carries this prefix in the interface's mac, because microvm.nix requires one,
+# and matches its network on the interface name rather than on this, because
+# the address differs per launch.
 GUEST_MAC_PREFIX = 0x020000
 GUEST_MAC_INDEX_LIMIT = 0xFFFFFF
 # The interface the guest reads its own address from. guest.nix pins this
 # name with a .link unit, so it is the name the captured guest and all 64
 # restores have; the harness asks for the address by this name.
 GUEST_NIC_NAME = "net0"
+# Where a guest finds the interface, the address it currently has, the device
+# behind it, and the driver that probes that device. All four are read inside
+# the guest: the address is what the re-probe is for, the device's name is what
+# the unbind and bind are addressed by, and the driver is the re-probe itself.
+GUEST_NIC_SYSFS_PATH = f"/sys/class/net/{GUEST_NIC_NAME}"
+GUEST_NIC_ADDRESS_PATH = f"{GUEST_NIC_SYSFS_PATH}/address"
+GUEST_NIC_DEVICE_PATH = f"{GUEST_NIC_SYSFS_PATH}/device"
+VIRTIO_NET_DRIVER_PATH = "/sys/bus/virtio/drivers/virtio_net"
+# The address a guest reports to: slirp's gateway, which is the host as the guest
+# sees it, and the only way back from a node whose forward no longer aims at it.
+GUEST_REPORT_GATEWAY = "10.0.2.2"
+# A re-probe costs its node the network for about a second, after which networkd
+# re-acquires a lease -- a different one, since a new MAC is a new client to
+# slirp's DHCP server, which is why the forwards are re-aimed afterwards. What
+# is waited out here is generous on purpose: this budget is readiness, and a
+# node that never reports is a failed run rather than a slow one.
+NIC_REPROBE_TIMEOUT_S = 120.0
+NIC_REPROBE_POLL_S = 0.25
 # The guest-side ports the two host forwards carry. Named because a forward
 # is a claim about one of them, and which one it is has to be readable where
 # the forward is issued.
@@ -91,8 +110,24 @@ GUEST_SSH_PORT = 22
 GUEST_HEALTH_PORT = 8080
 # QEMU holds the address it programmed into a NIC as a QOM property, which is
 # the host's own view of the device and needs no help from the guest to read.
-QMP_PERIPHERAL_PATH = "/machine/peripheral"
+# The machine's own child containers are the places a device can be, so the
+# NIC is looked for among them rather than at one path this harness names.
+QMP_MACHINE_PATH = "/machine"
 QMP_NIC_MAC_PROPERTY = "mac"
+# qom-list reports a child of the listed path as child<TYPE> and a property of
+# it as that property's own type, so the type alone tells the two apart. A
+# match has to be a child: every container here also lists a property named
+# "type" whose type is the string "string", and a link property reports
+# link<TYPE>, so neither is a device and neither can be a NIC.
+QMP_CHILD_TYPE_PREFIX = "child<"
+QMP_CONTAINER_TYPE = "container"
+QMP_NIC_TYPE = "virtio-net"
+# The environment variable the runner substitutes into the NIC's -device line
+# for the address this launch names (see default.nix). It is per-child because
+# QEMU realizes the device while building the machine: a realized device's
+# properties are read-only, so the address has to be chosen as the device is
+# created, not written once the monitor is reachable.
+QMP_NIC_MAC_ENV = "FANOUT_NIC_MAC"
 # RAM-backed home for the fleet's -snapshot disk overlays (see create_vm_scratch).
 VM_SCRATCH_ROOT = Path("/dev/shm")
 # Per-guest RAM-scratch allowance for the qcow2 overlay itself, its ext4
@@ -221,13 +256,15 @@ def guest_mac(index: int) -> str:
     """The MAC address of VM ``index`` (1-based, as every VM number here).
 
     Nothing in a restored guest is written per VM: 64 of them resume one
-    captured snapshot, so the address cannot be burned into the image and
-    fw_cfg is read only at boot, which a restore never reaches. The NIC's
-    address is set per launch instead, and the guest reads it back from the
-    device. 0x02 in the top octet marks it locally administered and the low
-    bit stays clear, so it is unicast and cannot collide with a vendor
-    address on the host network. The index fills the low three octets, so VM
-    1 keeps 02:00:00:00:00:01, the address the capture was taken with.
+    captured snapshot, and fw_cfg is read only at boot, which a restore never
+    reaches. The image's own mac cannot carry a per-VM value either, so the
+    NIC's address is chosen by the launch, which puts it on the device as the
+    machine is built (see launch_vms), and the guest reads it back from there.
+    0x02 in the top octet marks it locally administered and the low bit stays
+    clear, so it is unicast and cannot collide with a vendor address on the
+    host network. The index fills the low three octets, so VM 1 keeps
+    02:00:00:00:00:01, which is both IMAGE_GUEST_MAC and the address the
+    capture was taken with.
     """
     if not 1 <= index <= GUEST_MAC_INDEX_LIMIT:
         raise HarnessError(f"VM {index}: index is out of range for a derived MAC address")
@@ -235,14 +272,16 @@ def guest_mac(index: int) -> str:
     return ":".join(f"{octet:02x}" for octet in packed.to_bytes(6, "big"))
 
 
-def guest_mac_args(index: int) -> list[str]:
-    """QEMU arguments giving this launch its own NIC address.
-
-    guest.nix leaves the interface without an address, so -global is the
-    only source: an explicit mac= on -device wins over it, and QEMU's own
-    fallback is the same 52:54:00:12:34:56 for every VM.
-    """
-    return ["-global", f"virtio-net-pci.mac={guest_mac(index)}"]
+# The address the guest image carries (guest.nix, microvm.interfaces[].mac), and
+# the default the runner falls back to when a launch names none.
+# microvm.nix declares mac with no default, so the image cannot omit it, and it
+# writes that value straight into the NIC's -device line. The runner substitutes
+# the launch's own address in its place (see QMP_NIC_MAC_ENV), because a
+# -device is realized while QEMU builds the machine and a realized device's
+# properties are read-only. The capture guest is VM 1, so carrying VM 1's
+# address is what keeps the capture booting on the address its snapshot is read
+# back under; every launch names its own.
+IMAGE_GUEST_MAC = guest_mac(1)
 
 
 @dataclass
@@ -613,15 +652,23 @@ def launch_vms(
     # A restore waits for its state via QMP (-incoming defer). Every restore
     # shares the captured disk; -snapshot sends this VM's writes to a
     # temporary overlay in its TMPDIR (the workdir), so the image stays pristine.
-    argv = [str(runner), *extra_args]
+    #
+    # -S holds every launch at reset, and the per-VM address reaches QEMU in
+    # this VM's environment rather than on the shared argv: the runner
+    # substitutes FANOUT_NIC_MAC into the NIC's own -device line (see
+    # default.nix), because a -device is realized while QEMU builds the
+    # machine and a realized device's properties are read-only, so the address
+    # cannot be written afterwards over QMP. One argv can therefore carry 64
+    # launches only because the value that has to differ is per-child.
+    argv = [str(runner), "-S", *extra_args]
     if snapshot is not None:
         argv += ["-snapshot", "-incoming", "defer"]
         argv += guest_ram_args(snapshot.ram, snapshot.ram_mib, share=False)
     for index in range(1, count + 1):
-        # The address is per launch, so it belongs to this VM's argv and not to
-        # the shared one above: the capture guest is VM 1 of its own run and the
-        # fleet restores 64 copies of it that must not answer to one address.
-        vm_argv = [*argv, *guest_mac_args(index)]
+        # The image's address is VM 1's and the argv is shared, so the value
+        # that differs per VM travels in this child's environment: the capture
+        # guest is VM 1 of its own run, and the fleet restores 64 copies of it
+        # that must not answer to one address.
         workdir = run_dir / f"vm{index}"
         workdir.mkdir(mode=0o700)
         qmp_socket = workdir / QMP_SOCKET_NAME
@@ -650,9 +697,10 @@ def launch_vms(
             vm_tmpdir.mkdir(mode=0o700)
         child_env = os.environ.copy()
         child_env["TMPDIR"] = str(vm_tmpdir)
+        child_env[QMP_NIC_MAC_ENV] = guest_mac(index)
         try:
             process = subprocess.Popen(
-                vm_argv,
+                argv,
                 cwd=workdir,
                 env=child_env,
                 stdin=subprocess.DEVNULL,
@@ -761,32 +809,35 @@ def bring_up_vm(
             qmp.execute("migrate-set-capabilities", SNAPSHOT_CAPABILITIES, deadline)
             qmp.execute("migrate-incoming", {"uri": f"file:{snapshot.state}"}, deadline)
             wait_for_migration(qmp, vm.index, deadline)
-            qmp.execute("cont", None, deadline)
-        # After cont, so this reads the device as the restore left it rather
-        # than as the launch arguments described it.
-        #
+
+        # The address this launch asked for, checked against the device that
+        # holds it. The launch names it in the child's environment and the
+        # runner substitutes it into the NIC's -device line as QEMU builds the
+        # machine, so there is nothing to write here: a -device is realized
+        # before the monitor is reachable and a realized device's properties
+        # are read-only, which is why the value travels in the environment at
+        # all. The read is after the restore and after cont, so it reports the
+        # running device rather than what this launch asked for.
+        nic_path = find_nic_qom_path(qmp, vm.index, deadline)
+        qmp.execute("cont", None, deadline)
+
         # ESTABLISHED, and enforced here: the address this launch assigned is
-        # the address QEMU holds for this VM's NIC. -global is the only source
-        # of that address (guest_mac_args), so a device holding a different one
+        # the address QEMU holds for this VM's NIC. The launch's own value is
+        # the only source of that address, so a device holding a different one
         # was never given it, and no guest-side reading can be told apart from
         # that: the same fleet-wide result follows from a device given the
         # wrong address and from a guest that read the right one wrongly.
         #
-        # NOT ESTABLISHED, and only reported: that the running guest's own view
-        # of the device is this address. The guest kernel reads a NIC address
-        # when the driver probes the device and keeps it in dev_addr from then
-        # on, and a restore carries the capture-time device state with it, so
-        # a guest can legitimately name the address the capture was taken with
-        # rather than the one this launch passed. Whether it does has not been
-        # established against a real capture and restore cycle, so
-        # assert_fleet_node_identity_is_per_launch records it per node beside
-        # the address read here rather than assuming it either way.
+        # The guest's own view of the device is made to be this address, by
+        # reprobe_fleet_nics before any node is asked what it is: the kernel
+        # reads a NIC address when the driver probes the device and keeps it in
+        # dev_addr from then on, and a restore carries the capture-time state
+        # with it, so an unprobed guest names the address the capture booted
+        # with. Only a re-probe reaches the device's config space, so that is
+        # what the guest-side check rests on.
         vm.device_address = qmp.execute(
             "qom-get",
-            {
-                "path": find_nic_qom_path(qmp, vm.index, deadline),
-                "property": QMP_NIC_MAC_PROPERTY,
-            },
+            {"path": nic_path, "property": QMP_NIC_MAC_PROPERTY},
             deadline,
         )
         assigned = guest_mac(vm.index)
@@ -800,27 +851,55 @@ def bring_up_vm(
 
 
 
+def qom_child_type(entry: Any) -> str | None:
+    """The device type a qom-list entry names, or None if it names a property.
+
+    A child is reported as child<TYPE> and a property as that property's own
+    type, so the type alone tells the two apart. A name that mentions
+    virtio-net is therefore not evidence of anything on its own: only a child
+    can be a device, and only a device can hold a NIC address.
+    """
+    if not isinstance(entry, dict) or not entry.get("name"):
+        return None
+    reported = str(entry.get("type", ""))
+    if not reported.startswith(QMP_CHILD_TYPE_PREFIX) or not reported.endswith(">"):
+        return None
+    return reported[len(QMP_CHILD_TYPE_PREFIX) : -1]
+
+
 def find_nic_qom_path(qmp: QmpConnection, vm_index: int, deadline: float) -> str:
-    """The QOM path of this VM's NIC.
+    """The QOM path of this VM's NIC, resolved from the machine as it stands.
 
     qom-get addresses a property by path and the runner does not name the NIC,
     so the peripheral is identified by device type rather than by an id this
-    harness would have to guess. Anything other than exactly one match is
-    refused rather than resolved: a machine with no NIC has no address to
-    report, and one with two has no single answer.
+    harness would have to guess. The runner's -device carries no id=, so the
+    device is anonymous: QEMU parents it under one of the machine's own child
+    containers and names it device[N] for the index it took there. Which
+    container, and which index, belong to the launch and not to this harness,
+    so both are read from the live tree on every call and nothing is carried
+    across calls: a path remembered from one launch, or from one VM, is not a
+    path of the next.
+
+    Anything other than exactly one match is refused rather than resolved: a
+    machine with no NIC has no address to report, and one with two has no
+    single answer.
     """
-    peripherals = qmp.execute("qom-list", {"path": QMP_PERIPHERAL_PATH}, deadline)
+    searched = [
+        f"{QMP_MACHINE_PATH}/{entry['name']}"
+        for entry in qmp.execute("qom-list", {"path": QMP_MACHINE_PATH}, deadline)
+        if qom_child_type(entry) == QMP_CONTAINER_TYPE
+    ]
     paths = [
-        f"{QMP_PERIPHERAL_PATH}/{entry['name']}"
-        for entry in peripherals
-        if isinstance(entry, dict)
-        and entry.get("name")
-        and "virtio-net" in str(entry.get("type", ""))
+        f"{container}/{entry['name']}"
+        for container in searched
+        for entry in qmp.execute("qom-list", {"path": container}, deadline)
+        if (device_type := qom_child_type(entry)) is not None
+        and QMP_NIC_TYPE in device_type
     ]
     if len(paths) != 1:
         raise HarnessError(
-            f"VM {vm_index}: expected one virtio-net NIC under {QMP_PERIPHERAL_PATH}, "
-            f"found {len(paths)}"
+            f"VM {vm_index}: expected one virtio-net NIC under the machine's "
+            f"child containers ({', '.join(searched)}), found {len(paths)}"
         )
     return paths[0]
 
@@ -1459,6 +1538,204 @@ def fetch_guest_address(vm: VmProcess, ssh_key: Path, probe_binary: str) -> str:
     )
     return parse_reported_address(result.stdout, vm.index)
 
+def guest_nic_reprobe_script(vm: VmProcess, report_port: int) -> str:
+    """The shell one guest runs to re-probe its NIC and say where it landed.
+
+    The order is the whole design. The device's name is read while the netdev is
+    still there to read it from, because afterwards the path it comes from is
+    gone with the netdev, and sysfs addresses an unbind and a bind by device
+    name rather than by driver name. The address is reported only once the
+    guest holds one again, because the report is what the host aims a forward
+    with.
+
+    The report goes to slirp's gateway, which is the host as the guest sees it,
+    and that is the only way back for a node that has moved. A forward added
+    without a guest address resolves to 10.0.2.15 and stays there for the life
+    of the run, while the re-probed guest is re-leased a different address,
+    because to slirp's DHCP server a new MAC is a new client. So the node the
+    host can no longer reach is exactly the node that has to report.
+    """
+    read_address = (
+        f"IP=$(ip -4 -o addr show {GUEST_NIC_NAME} 2>/dev/null | "
+        "awk '{print $4}' | cut -d/ -f1 | head -1); "
+    )
+    return (
+        "( VDEV=$(basename $(readlink -f " + GUEST_NIC_DEVICE_PATH + ")); "
+        f"echo $VDEV > {VIRTIO_NET_DRIVER_PATH}/unbind; "
+        f"echo $VDEV > {VIRTIO_NET_DRIVER_PATH}/bind; "
+        f"IP=; i=0; while [ $i -lt {int(NIC_REPROBE_TIMEOUT_S)} ]; do "
+        + read_address
+        + '[ -n "$IP" ] && break; i=$(( i + 1 )); sleep 1; done; '
+        f'echo "{vm.index} $IP" | busybox nc -w 5 {GUEST_REPORT_GATEWAY} {report_port} '
+        ") </dev/null >/dev/null 2>&1 &"
+    )
+
+
+def issue_guest_nic_reprobe(vm: VmProcess, ssh_key: Path, report_port: int) -> None:
+    """Start this guest's NIC re-probe, without waiting for it to finish.
+
+    The re-probe tears the node's netdev down, so the session that asks for it is
+    expected to die with the link and its exit status says nothing about whether
+    the re-probe happened. The work is detached for the same reason, and the
+    guest's own report is what says whether it landed.
+    """
+    try:
+        subprocess.run(
+            host_ssh_command(
+                ssh_key, vm.ssh_port, guest_nic_reprobe_script(vm, report_port)
+            ),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=VERIFY_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Losing the link mid-request is the expected outcome, not a fault to
+        # report: the guest's report is the only thing that says it worked.
+        pass
+
+
+def collect_nic_reprobe_reports(
+    vms: Sequence[VmProcess], listener: socket.socket, deadline: float
+) -> dict[int, str]:
+    """Every guest's report of the address it holds after its re-probe.
+
+    A report is "<node> <address>", and both halves are refused rather than
+    guessed: an unknown node would leave a forward aimed at nothing, and an
+    address that is not one would be aimed by a forward that cannot use it.
+    """
+    reports: dict[int, str] = {}
+    while len(reports) < len(vms):
+        if time.monotonic() >= deadline:
+            missing = ", ".join(str(vm.index) for vm in vms if vm.index not in reports)
+            raise HarnessError(
+                f"these nodes did not report the address they re-probed onto: {missing}"
+            )
+        listener.settimeout(max(0.05, min(1.0, deadline - time.monotonic())))
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            continue
+        except OSError as error:
+            raise HarnessError(f"the NIC re-probe report listener failed: {error}") from error
+        with connection:
+            connection.settimeout(5.0)
+            chunks: list[bytes] = []
+            try:
+                while True:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except OSError:
+                pass
+        reported = b"".join(chunks).decode("utf-8", "replace").strip()
+        node, _, address = reported.partition(" ")
+        if node.strip() not in {str(vm.index) for vm in vms} or not address.strip():
+            raise HarnessError(f"unreadable NIC re-probe report: {reported!r}")
+        reports[int(node)] = address.strip()
+    return reports
+
+
+def repoint_vm_forwards(vm: VmProcess, guest_address: str) -> None:
+    """Re-add this node's host forwards, aimed at the address it now holds.
+
+    Both forwards, and both removed first: the SSH one because the identity read
+    needs it, the health one because a forward still aimed at 10.0.2.15 would
+    report this node as never serving health. A node whose health forward was
+    withheld has no health forward to move.
+    """
+    deadline = time.monotonic() + NIC_REPROBE_TIMEOUT_S
+    connection = connect_qmp(vm, deadline)
+    try:
+        qmp = QmpConnection(connection, vm.index)
+        qmp.negotiate(deadline)
+        forwards = [(vm.ssh_port, GUEST_SSH_PORT)]
+        if vm.health_forwarded:
+            forwards.append((vm.http_port, GUEST_HEALTH_PORT))
+        for host_port, guest_port in forwards:
+            # The two commands report success differently, and both are checked:
+            # hostfwd_remove names the rule it removed, hostfwd_add says nothing
+            # at all when it worked, which is the contract bring_up_vm already
+            # relies on for the add.
+            remove = f"hostfwd_remove net0 tcp:127.0.0.1:{host_port}"
+            removed = qmp.execute(
+                "human-monitor-command", {"command-line": remove}, deadline
+            )
+            if "removed" not in removed:
+                raise HarnessError(
+                    f"VM {vm.index}: QMP command {remove!r} did not remove the existing "
+                    f"forward: {removed!r}"
+                )
+            add = f"hostfwd_add net0 tcp:127.0.0.1:{host_port}-{guest_address}:{guest_port}"
+            added = qmp.execute(
+                "human-monitor-command", {"command-line": add}, deadline
+            )
+            if added != "":
+                raise HarnessError(
+                    f"VM {vm.index}: QMP command {add!r} returned an error: {added!r}"
+                )
+    finally:
+        connection.close()
+
+
+def await_guest_ssh(vm: VmProcess, ssh_key: Path) -> None:
+    """Block until this guest answers over its re-aimed SSH forward."""
+    deadline = time.monotonic() + NIC_REPROBE_TIMEOUT_S
+    while True:
+        result = subprocess.run(
+            host_ssh_command(ssh_key, vm.ssh_port, "true", connect_timeout_s=5),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=VERIFY_TIMEOUT_S,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise HarnessError(
+                f"VM {vm.index}: the guest did not answer over its re-aimed SSH forward "
+                f"within {NIC_REPROBE_TIMEOUT_S:g}s: {summarize_output(result.stdout, result.stderr)}"
+            )
+        time.sleep(NIC_REPROBE_POLL_S)
+
+
+def reprobe_fleet_nics(vms: Sequence[VmProcess], ssh_key: Path) -> None:
+    """Make every node re-probe its NIC, and follow each one to where it lands.
+
+    All of them at once because each re-probe is a second of its own node's time
+    and the budget is the whole fleet's: asked one at a time, 64 nodes pay 64
+    seconds where in parallel they pay one. Each node is then re-aimed at the
+    address it reported and waited for, because a node that cannot be reached is
+    a node the run cannot ask anything else.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(max(2, len(vms)))
+        report_port = listener.getsockname()[1]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
+            futures = [
+                executor.submit(issue_guest_nic_reprobe, vm, ssh_key, report_port)
+                for vm in vms
+            ]
+            collect_parallel_failures("guest NIC re-probe", futures)
+        reports = collect_nic_reprobe_reports(
+            vms, listener, time.monotonic() + NIC_REPROBE_TIMEOUT_S
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
+            futures = [
+                executor.submit(repoint_vm_forwards, vm, reports[vm.index]) for vm in vms
+            ]
+            collect_parallel_failures("guest NIC re-probe forwards", futures)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(vms)) as executor:
+            futures = [executor.submit(await_guest_ssh, vm, ssh_key) for vm in vms]
+            collect_parallel_failures("guest NIC re-probe readiness", futures)
+    finally:
+        listener.close()
+
 
 def assert_fleet_node_identity_is_per_launch(
     vms: Sequence[VmProcess], ssh_key: Path, probe_binary: str
@@ -1471,20 +1748,20 @@ def assert_fleet_node_identity_is_per_launch(
     addresses nodes by their forwarded port. So each node reads the address
     out of its own device and has to name the one this launch assigned it.
 
-    Two different things are measured, and only one of them is established.
-    That the per-launch address reached the device is established and
-    enforced in bring_up_vm, which reads it back from QEMU. That the guest's
-    own view of the device is that address is checked here but NOT
-    established: the kernel caches a probed NIC address in dev_addr and a
-    restore carries the capture-time state with it, so a guest can name the
-    capture-time address without the injection having failed. That has not
-    been established against a real capture and restore cycle either way, so
-    it is not assumed here: every node's answer is recorded before any
-    failure is raised, and node_identity_report publishes each answer beside
-    the address QEMU holds for the device it read. A node naming a different
-    address fails the run, because a fleet answering to one address is the
-    outcome this check exists to catch, and it fails with the measurement
-    that explains it rather than without.
+    Two different things are measured here, and both are established by the
+    time this runs. That the per-launch address reached the device is enforced
+    in bring_up_vm, which reads it back from QEMU, and that the guest's own view
+    of the device is that address is established by reprobe_fleet_nics, which
+    makes each guest's driver read the device again: without it the kernel
+    caches a probed NIC address in dev_addr and a restore carries the
+    capture-time state with it, so every node would name the address the
+    capture booted with. What is left checked rather than assumed is the
+    reading itself, so every node's answer is recorded before any failure is
+    raised, and node_identity_report publishes each answer beside the address
+    QEMU holds for the device it read. A node naming a different address fails
+    the run, because a fleet answering to one address is the outcome this check
+    exists to catch, and it fails with the measurement that explains it rather
+    than without.
 
     The host's view of the same device is quoted in the failure so the side
     the disagreement is on is named: a guest reading the capture-time address
@@ -2024,6 +2301,14 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         bring_up_max_s = start_all_vms(
             vms, reservations, ssh_key, readiness_deadline, snapshot, args.ready_probe_command
         )
+        # Part of bringing the fleet up rather than a step after it, and timed
+        # as such: a node's network is down while its driver re-reads the
+        # device, so it is not ready until it has been re-probed, and the
+        # re-probed address is the whole reason the readiness exchange that
+        # precedes it cannot tell 64 restored nodes apart on its own. Excluded
+        # from readiness_s it would be a second of every node's time that the
+        # reported number did not pay for.
+        reprobe_fleet_nics(vms, ssh_key)
         readiness_s = time.monotonic() - readiness_started
         ready_within_target = readiness_s < READINESS_TARGET_S
 

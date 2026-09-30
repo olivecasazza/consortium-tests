@@ -45,14 +45,25 @@ let
   # so the launcher can capture and restore snapshots (-snapshot, -incoming);
   # with no arguments the VM boots exactly as microvm.nix defines it.
   #
+  # The NIC's address is also made per-launch, and has to be: QEMU realizes a
+  # -device while it builds the machine, before the monitor is reachable, and
+  # a realized device's properties are read-only, so a qom-set of the address
+  # over QMP is refused. microvm.nix writes the image's mac straight into the
+  # -device line, so the launch's own value is substituted in its place, from
+  # the environment the launcher sets per VM. The default is the image's
+  # address, so a launch that sets nothing still boots on it.
+  #
   # microvm-restore is the same machine without -kernel/-initrd/-append. A
   # restore never boots, yet QEMU would read the kernel and initrd into
   # per-VM ROM blobs (~90 MB each) that only a guest reset uses.
   runner = vmHostPackages.runCommand "fanout64-microvm-run" { meta.mainProgram = "microvm-run"; } ''
     mkdir -p $out/bin
-    sed 's/\''${runtime_args:-}[[:space:]]*$/''${runtime_args:-} "$@"/' \
-      ${lib.getExe' configuration.config.microvm.runner.qemu "microvm-run"} > $out/bin/microvm-run
+    sed -e 's/''${runtime_args:-}[[:space:]]*$/''${runtime_args:-} "$@"/' \
+        -e "s|'virtio-net-pci,\(.*\),romfile='|\"virtio-net-pci,\\1,romfile=\"|" \
+        -e 's|,mac=\([0-9a-fA-F:]*\),|,mac=''${FANOUT_NIC_MAC:-\1},|' \
+        ${lib.getExe' configuration.config.microvm.runner.qemu "microvm-run"} > $out/bin/microvm-run
     grep -q 'runtime_args:-} "\$@"$' $out/bin/microvm-run
+    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01},' $out/bin/microvm-run
     sed -E "s/ -kernel [^ ]+//; s/ -initrd [^ ]+//; s/ -append '[^']*'//" \
       $out/bin/microvm-run > $out/bin/microvm-restore
     if grep -qE -- ' -(kernel|initrd|append) ' $out/bin/microvm-restore; then
@@ -60,6 +71,7 @@ let
       exit 1
     fi
     grep -q 'runtime_args:-} "\$@"$' $out/bin/microvm-restore
+    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01},' $out/bin/microvm-restore
     chmod +x $out/bin/microvm-run $out/bin/microvm-restore
   '';
 in

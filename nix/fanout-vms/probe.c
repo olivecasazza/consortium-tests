@@ -99,11 +99,13 @@ static int emit_entropy(long want)
 /* Third mode: print the address the kernel has for an interface, now.
  *
  * The address belongs to the launch (guest_mac in bench.py), not to the
- * image: all 64 nodes resume one captured snapshot, so no value the build
- * knew can be right for them, and nothing is written at boot for the same
- * reason. Reading sysfs per invocation is what makes the answer the device's
- * own current state, and it is what a node has to consult to say which of the
- * 64 it is -- one shared address would leave that unanswerable.
+ * image: all 64 nodes resume one captured snapshot, and the image carries
+ * only the capture guest's, so no value the build knew can be right for the
+ * rest. bench.py programs each launch's address into the device over QMP
+ * before the guest runs. Reading sysfs per invocation is what makes the
+ * answer the device's own current state, and it is what a node has to
+ * consult to say which of the 64 it is -- one shared address would leave
+ * that unanswerable.
  *
  * FANOUT_SYSFS_NET is a build-time constant so the guest gets sysfs and a
  * test can point this same source at a fixture tree. The address itself is

@@ -198,6 +198,19 @@ Every run also reports `state_isolation_verified` and
 guests are genuinely independent and exchanging real data - not merely that
 64 sockets accepted a connection.
 
+**Each node re-probes its NIC inside the readiness window.** A restored guest
+resumes the capture's kernel state, and the kernel reads a NIC address once,
+when the driver probes the device, and keeps it from then on - so every node
+would answer with the capture guest's address even though QEMU holds a distinct
+one per launch. The run therefore unbinds and rebinds `virtio_net` on each node
+so the driver reads the device again, which costs the node its network for
+about a second. A new MAC is a new client to slirp's DHCP server, so the guest
+is re-leased a different address, and the run follows it: each guest reports
+where it landed to the host through slirp's gateway, and the host re-aims that
+node's SSH and health forwards at it. The step is inside `readiness_s` rather
+than beside it, because a node that cannot be asked its address is a node the
+run has not finished bringing up.
+
 **Snapshot restore, not boot tuning, is what made this pass.** Everything below
 documents the cold-boot path: it is what produced the 20.8 s figure and the
 13-14 s figures quoted in the vCPU tables, all under `--boot cold`. With the

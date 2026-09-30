@@ -55,11 +55,16 @@ in
       {
         type = "user";
         id = "net0";
-        # No mac: bench.py gives every launch its own address with
-        # -global virtio-net-pci.mac=, because an explicit mac= here wins over
-        # it and would hand all 64 restored guests one address. A guest that
-        # left this to QEMU would fall back to the same 52:54:00:12:34:56
-        # anyway, so the harness has to be the one to say.
+        # microvm.nix declares this option with no default and destructures it
+        # when it builds the -device line, so an interface without one fails
+        # evaluation. The value is the capture-time address, which is VM 1's:
+        # the capture guest boots from this image. It is also the runner's
+        # fallback, because each launch substitutes its own address into this
+        # very mac= as QEMU builds the machine (see default.nix). An explicit
+        # mac= here outranks a -global virtio-net-pci.mac= passed at launch,
+        # and a -device is realized before the monitor is reachable, so the
+        # address cannot be written onto the device afterwards over QMP.
+        mac = "02:00:00:00:00:01";
       }
     ];
     forwardPorts = [ ];
