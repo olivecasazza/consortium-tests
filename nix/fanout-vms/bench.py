@@ -25,6 +25,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Sequence
 
+# cascade_tree is a sibling module. bench.py runs as a script from this
+# directory, but the unit tests import it from elsewhere, so put the directory
+# on the path explicitly rather than relying on sys.path[0].
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cascade_tree  # noqa: E402  (sibling module, resolved above)
+
 SSH_PORT_BASE = 22200
 HTTP_PORT_BASE = 28200
 MAX_VM_COUNT = 64
@@ -963,6 +970,91 @@ def write_inventory(path: Path, count: int) -> str:
     return content
 
 
+def cascade_command(store_path: Path, inventory: str, *, fanout: int) -> str:
+    """The guest-side command that distributes one closure across the fleet.
+
+    `--format jsonl` is what makes this checkable at all: cascade-copy runs
+    with a non-TTY stdout over SSH, where it otherwise wires a NullSink and
+    emits nothing, leaving only its exit status as evidence.
+    """
+    return shlex.join(
+        [
+            "cascade-copy",
+            str(store_path),
+            "--inventory",
+            inventory,
+            "--strategy",
+            "log2-fanout",
+            "--fanout",
+            str(fanout),
+            "--no-watch",
+            "--format",
+            "jsonl",
+        ]
+    )
+
+
+def verify_cascade_relay(stream: str, *, count: int, fanout: int) -> dict[str, int]:
+    """Assert the cascade really relayed, and describe the tree it built.
+
+    The CLI's exit status cannot tell a peer-to-peer cascade from a host that
+    pushed to every guest in turn: both exit 0. Only the tree can, so this
+    reads the run's own event stream and fails when no peer ever served
+    another.
+    """
+    try:
+        topology = cascade_tree.parse_cascade_events(stream)
+        cascade_tree.assert_relay_was_used(topology, fanout=fanout)
+    except cascade_tree.CascadeTreeError as error:
+        raise HarnessError(f"cascade relay check failed: {error}") from error
+    if topology.n_nodes != count:
+        raise HarnessError(
+            f"cascade covered {topology.n_nodes} nodes, expected {count}"
+        )
+    return {
+        "nodes": topology.n_nodes,
+        "rounds": topology.rounds,
+        "relay_depth": topology.depth,
+        "relayed_nodes": len(topology.parent),
+    }
+
+
+def run_cascade(
+    ssh_key: Path,
+    store_path: Path,
+    inventory_content: str,
+    *,
+    count: int,
+    fanout: int,
+) -> dict[str, int]:
+    """Distribute one closure across the fleet and prove the relay was used.
+
+    Returns the topology summary. Raises if the cascade did not converge over
+    the whole fleet, or converged without ever relaying - which is the case a
+    green exit status cannot distinguish from a real fan-out.
+    """
+    run_checked(
+        f"write cascade inventory to {INVENTORY_GUEST_PATH}",
+        host_ssh_command(
+            ssh_key,
+            SSH_PORT_BASE + 1,
+            f"umask 077; cat > {shlex.quote(INVENTORY_GUEST_PATH)}",
+        ),
+        timeout=VERIFY_TIMEOUT_S,
+        input_text=inventory_content,
+    )
+    completed = run_checked(
+        "guest cascade-copy",
+        host_ssh_command(
+            ssh_key,
+            SSH_PORT_BASE + 1,
+            cascade_command(store_path, INVENTORY_GUEST_PATH, fanout=fanout),
+        ),
+        timeout=CASCADE_TIMEOUT_S,
+    )
+    return verify_cascade_relay(completed.stdout, count=count, fanout=fanout)
+
+
 def assert_probe_file_is_durable(vm: VmProcess, ssh_key: Path) -> None:
     """Fail the run if the readiness sync can no-op on a RAM filesystem.
 
@@ -1188,38 +1280,16 @@ def deploy_and_verify(
         env=nix_ssh_environment(),
     )
 
-    run_checked(
-        "inventory upload to seed",
-        host_ssh_command(
-            ssh_key,
-            SSH_PORT_BASE + 1,
-            f"umask 077; cat > {shlex.quote(INVENTORY_GUEST_PATH)}",
-        ),
-        timeout=VERIFY_TIMEOUT_S,
-        input_text=inventory_content,
-    )
-
-    cascade_command = shlex.join(
-        [
-            "cascade-copy",
-            str(store_path),
-            "--inventory",
-            INVENTORY_GUEST_PATH,
-            "--strategy",
-            "log2-fanout",
-            "--fanout",
-            "2",
-            "--no-watch",
-        ]
-    )
-    run_checked(
-        "guest cascade-copy",
-        host_ssh_command(ssh_key, SSH_PORT_BASE + 1, cascade_command),
-        timeout=CASCADE_TIMEOUT_S,
+    cascade = run_cascade(
+        ssh_key,
+        store_path,
+        inventory_content,
+        count=len(vms),
+        fanout=2,
     )
 
     verify_all_store_paths(vms, ssh_key, store_path, binary_relative_path, expected_stdout)
-    return time.monotonic() - deployment_started
+    return time.monotonic() - deployment_started, cascade
 
 
 def verify_all_store_paths(
@@ -1503,7 +1573,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
         prove_guest_gateway_relay(ssh_key)
         assert_store_path_absent(vms, ssh_key, args.store_path)
         inventory_content = write_inventory(run_dir / "inventory.toml", args.count)
-        deployment_s = deploy_and_verify(
+        deployment_s, cascade_topology = deploy_and_verify(
             vms,
             ssh_key,
             args.store_path,
@@ -1533,6 +1603,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             # restore). The remainder, readiness_s - launch - bring_up_max, is
             # SSH/HTTP polling. launch used to be added into bring_up_max,
             # which double-counted the whole spawn phase against QMP bring-up.
+            "cascade_topology": cascade_topology,
             "readiness_phases_s": {
                 "launch": round(launch_s, 6),
                 "bring_up_max": round(bring_up_max_s, 6),
@@ -1541,7 +1612,10 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             "ready_within_target": ready_within_target,
             "status": "ok" if ready_within_target else "performance_target_missed",
             "statuses": {
-                "cascade_copy": "ok",
+                # Not the CLI's exit status: the tree the run actually built.
+                # A cascade that pushed host-to-each-guest exits 0 and would
+                # otherwise be recorded identically to a real fan-out.
+                "cascade_relay_verified": count,
                 "guest_gateway_relay": "ok",
                 "host_to_seed": "ok",
                 "payload_executions_verified": args.count,
