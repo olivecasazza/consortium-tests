@@ -13,6 +13,10 @@
 struct VM {
   prog : array<u32, 16>,   // 64 bytes of bytecode
   stack: array<u32, 64>,   // 256-byte stack
+  // Per-VM data words. The host stages input here before dispatch; the VM
+  // writes its result back here, and the host reads it out after. This is
+  // the only "I/O" a compute shader has: no syscalls, no MMU, no traps.
+  data : array<u32, 16>,
   sp    : u32,
   pc    : u32,
   halted: u32,
@@ -33,9 +37,21 @@ const OP_DEC  : u32 = 8u;
 const OP_JMP  : u32 = 9u;
 const OP_JZ   : u32 = 10u;
 const OP_HALT : u32 = 11u;
+// Load/store against the per-VM data array. 12 = LOAD (push data[i]),
+// 13 = STORE (data[i] = top of stack).
+const OP_LOAD : u32 = 12u;
+const OP_STORE: u32 = 13u;
 
 @group(0) @binding(0) var<storage, read_write> vms : array<VM>;
 @group(0) @binding(1) var<storage, read_write> steps : array<atomic<u32>>;
+
+// Sign-extend a jump displacement. Only bytes >= 128 are negative; an
+// unconditional -256 turned a forward jump of 2 into -254 and sent the pc
+// out of the 16-word program array.
+fn jmp_disp(v: VM) -> i32 {
+  let raw = (v.prog[v.pc >> 2u] >> ((v.pc & 3u) * 8u)) & 0xffu;
+  return select(i32(raw), i32(raw) - 256, raw >= 128u);
+}
 
 @compute @workgroup_size(64)
 fn run(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -72,15 +88,24 @@ fn run(@builtin(global_invocation_id) gid: vec3<u32>) {
       case 9u: { // JMP
         // Sign-extend the displacement: a u8 add can only move forward, so
         // without this the VM cannot express a loop at all.
-        let d = i32((v.prog[v.pc >> 2u] >> ((v.pc & 3u) * 8u)) & 0xffu) - 256;
+        let d = jmp_disp(v);
         v.pc = u32(i32(v.pc) + d + 1);
       }
       case 10u: { // JZ
         v.sp = v.sp - 1u;
         let z = v.stack[v.sp] & 0xffu;
-        let d = i32((v.prog[v.pc >> 2u] >> ((v.pc & 3u) * 8u)) & 0xffu) - 256;
+        let d = jmp_disp(v);
         v.pc = v.pc + 1u;
         if (z == 0u) { v.pc = u32(i32(v.pc) + d); }
+      }
+      case 12u: { // LOAD data[i] -> stack
+        let i = (v.prog[v.pc >> 2u] >> ((v.pc & 3u) * 8u)) & 0xffu;
+        v.stack[v.sp] = v.data[i]; v.sp = v.sp + 1u; v.pc = v.pc + 1u;
+      }
+      case 13u: { // STORE data[i] <- stack
+        let i = (v.prog[v.pc >> 2u] >> ((v.pc & 3u) * 8u)) & 0xffu;
+        v.sp = v.sp - 1u;
+        v.data[i] = v.stack[v.sp]; v.pc = v.pc + 1u;
       }
       case 11u: { v.halted = 1u; }
       default: { v.halted = 1u; }

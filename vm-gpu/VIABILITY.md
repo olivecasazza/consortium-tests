@@ -4,50 +4,66 @@ Measured on pdx-nxst-001, Quadro RTX 6000 (CC 7.5, driver 595.84) via Vulkan.
 Stack VM in WGSL (one VM per GPU invocation), CPU scalar reference, identical
 opcodes and identical instruction accounting. `work_match=yes` on every run:
 the GPU and CPU executed exactly the same number of VM instructions.
-
 ## Results
 
-| mode | VMs | CPU Ginstr/s | GPU Ginstr/s | speedup |
+| workload | 1k | 16k | 65k | 262k |
 |---|---|---|---|---|
-| straight-line | 1,024 | 0.166 | 0.364 | 2.20x |
-| straight-line | 16,384 | 0.164 | 2.421 | 14.75x |
-| straight-line | 65,536 | 0.172 | 3.386 | 19.72x |
-| straight-line | 262,144 | 0.170 | 3.932 | **23.18x** |
-| branching (loop) | 1,024 | 0.176 | 0.090 | **0.51x** |
-| branching (loop) | 16,384 | 0.194 | 0.634 | 3.27x |
-| branching (loop) | 65,536 | 0.177 | 0.885 | 4.99x |
-| branching (loop) | 262,144 | 0.186 | 1.001 | 5.37x |
+| branch-free | 2.20x | 14.75x | 19.72x | 23.18x |
+| looping, uniform trip count | 0.51x | 3.27x | 4.99x | 5.37x |
+| **fan-out/fan-in over staged data** | 2.01x | 3.73x | 3.73x | 3.82x |
+| **per-VM trip count (divergent)** | 11.88x | 21.16x | 22.36x | 22.51x |
 
-1,048,576 VMs does not run: the VM-state buffer is 360,710,144 bytes and
-exceeds wgpu's 268,435,456-byte maximum buffer size. That is a wgpu
-implementation limit, not a GPU limit, so **there is no measurement at
-1M** and the trend past 262,144 is unknown. The measured increments are
-shrinking (+5.0x then +3.5x from 16k to 262k), so an asymptote is as
-plausible as continued growth; do not extrapolate.
+All runs report `work_match=yes` (equal VM instruction counts on both sides)
+and `results_match=yes` (equal per-VM output values), so the speedups compare
+equal work, not merely equal time.
+
+## Read the small-N numbers carefully
+
+The GPU has a fixed dispatch cost that does not shrink with VM count.
+Measured on the divergent workload:
+
+| VMs | CPU | GPU | ratio |
+|---|---|---|---|
+| 4 | 4.0 us | 98.0 us | 0.04x |
+| 256 | 434 us | 89 us | 4.88x |
+| 1,024 | 1,824 us | 154 us | 11.88x |
+| 8,192 | 15,122 us | 747 us | 20.24x |
+
+GPU time is nearly flat from 4 to 8,192 VMs: a ~90 us fixed cost plus ~79 ns
+per VM, against ~1,846 ns per VM on the CPU. The marginal cost of a VM is ~23x
+cheaper on the GPU, but **at small N the ratio is pure launch overhead** and
+says nothing about throughput. A 0.04x at N=4 is not a slow GPU; it is a GPU
+that has not been given work to hide its pipeline behind.
 
 ## Verdict
 
 **Viable for throughput, not for latency, and only for data-parallel guests.**
 
-* Straight-line guests: 23x at 262k VMs, still scaling at the limit. A GPU
-  wins because each warp runs 32 independent VMs with no divergence.
-* Looping guests: 5.4x at scale, but only 0.51x at 1,024 VMs. A short
-  loop does not have enough work per VM to cover the launch cost.
-* The gap between 23x and 5.4x is warp divergence: branches desynchronise
-  the lanes that share a warp.
+- Identical work: 23x at 262k, climbing slowly.
+- Per-VM divergent work: 22.5x at 262k. Divergence costs less than expected
+  when each lane still has bulk work.
+- Fan-in (each VM consumes staged input and produces its own result): 3.8x,
+  flat from 16k to 262k.
+- Short uniform loops: 5.4x.
 
-This is the same shape the Glasgow paper reports (arXiv:2608.16387):
-19x parallel-vs-sequential on Stencil, but a sequential VM 50-100x slower than
-the CPU and never beating it. The paper's best GPU was a 22-CU laptop part;
-this is a 24 GB datacenter card, and the result is the same shape with a
-higher ceiling.
+The pattern is **work per VM**, not control flow alone. Divergence is cheap when
+lanes still have bulk work; it is expensive when each VM does only a handful of
+operations. The fan-in row (3.8x) is the most representative number for a real
+fleet, because 16 ops per VM is closer to real work than 1000 straight-line ops.
 
-## What this implies for a hypervisor
+This matches the Glasgow paper's shape (arXiv:2608.16387): 19x
+parallel-vs-sequential on Stencil, a sequential VM 50-100x slower than the CPU,
+and never beating it. Their best GPU was a 22-CU laptop part; this is a 24 GB
+datacenter card, so the ceiling is higher, but the shape is the same.
 
-A general guest does not look like the straight-line case. Linux boots are
-branchy and exit-heavy, which is the 5.4x case at best and the 0.51x case
-per-VM at small N. A GPU-hosted hypervisor would win throughput on
-data-parallel batches and lose on per-VM boot latency.
+## What this implies for fan-out -> fan-in on a real fleet
+
+A compute shader has no syscalls, no MMU and no traps. "I/O" is only: stage
+input into a per-VM buffer before dispatch, read results out after. That is a
+batch interface, not a service interface - you cannot run `sshd` and answer
+requests in these VMs. For the 64-node `fanout64` harness, whose nodes are
+heterogeneous services each with its own Nix store answering SSH and HTTP, the
+honest projection is the fan-in row (~3.8x), not the 22x rows.
 
 ## Environment notes
 
