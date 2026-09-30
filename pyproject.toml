@@ -1,6 +1,10 @@
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["*Test.py"]
+testpaths = ["tests", "nix/fanout-vms"]
+# `tests/` is the vendored upstream parity suite, which names files `*Test.py`.
+# `nix/fanout-vms/` is this repo's own suite, which uses the pytest default
+# `test_*.py`. Both patterns are needed: collecting only the first silently
+# reports zero tests for the second, which is a green run that ran nothing.
+python_files = ["*Test.py", "test_*.py"]
 python_classes = ["*Test"]
 python_functions = ["test*"]
 timeout = 30
