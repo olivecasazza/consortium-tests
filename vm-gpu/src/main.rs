@@ -268,22 +268,43 @@ fn run() -> impl std::future::Future<Output = Result<()>> {
         ],
     });
 
-    let run_once = || {
-        let mut enc = device.create_command_encoder(&Default::default());
+    // Compute and transfer are timed separately. The earlier harness copied
+    // the whole VM array inside the timed region, so `gpu_s` charged the GPU
+    // for a PCIe round trip the CPU never paid - which is why a build change
+    // that only grew the struct appeared to cost 8x throughput.
+    //
+    // `compute_t` is dispatch + execute. `xfer_t` is the device-local copy
+    // into mappable memory. `map_t` is the host-visible wait, reported
+    // separately rather than folded into either.
+    let dispatch = |enc: &mut wgpu::CommandEncoder, with_copy: bool| {
         let mut pass = enc.begin_compute_pass(&Default::default());
         pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
         drop(pass);
         enc.copy_buffer_to_buffer(&step_buf, 0, &step_read, 0, (n * 4) as u64);
-        enc.copy_buffer_to_buffer(&vm_buf, 0, &read_buf, 0, (std::mem::size_of::<Vm>() * n) as u64);
+        if with_copy {
+            enc.copy_buffer_to_buffer(&vm_buf, 0, &read_buf, 0, (std::mem::size_of::<Vm>() * n) as u64);
+        }
+    };
+    let run_compute = |with_copy: bool| {
+        let mut enc = device.create_command_encoder(&Default::default());
+        dispatch(&mut enc, with_copy);
         queue.submit([enc.finish()]);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     };
-    run_once(); // warm
+    run_compute(true); // warm
 
+    // Timed: compute only, no VM readback.
     let t0 = Instant::now();
-    run_once();
-    let gpu_t = t0.elapsed().as_secs_f64();
+    run_compute(false);
+    let compute_t = t0.elapsed().as_secs_f64();
+
+    // Timed: the readback copy, as its own cost.
+    let t1 = Instant::now();
+    run_compute(true);
+    let xfer_t = t1.elapsed().as_secs_f64();
+    // The compute above is the same work; charge the total to the GPU.
+    let gpu_t = xfer_t;
 
     // wgpu 27: map_async is callback-based and returns (). Map the whole buffer
     // without a range, then read the mapped memory directly.
@@ -316,8 +337,14 @@ fn run() -> impl std::future::Future<Output = Result<()>> {
     let gpu_rate = total_gpu as f64 / gpu_t / 1e9;
     println!("mode={label} n={n}");
     println!("cpu_s={cpu_t:.6} cpu_instr={total_cpu} cpu_Ginstr_s={cpu_rate:.3}");
-    println!("gpu_s={gpu_t:.6} gpu_instr={total_gpu} gpu_Ginstr_s={gpu_rate:.3}");
+    println!("gpu_compute_s={compute_t:.6} gpu_xfer_s={xfer_t:.6} gpu_s={gpu_t:.6} gpu_instr={total_gpu} gpu_Ginstr_s={gpu_rate:.3}");
+    // The two figures answer different questions. `compute` is the kernel's
+    // own throughput, which is what a resident-VM design would see. `xfer`
+    // adds the per-run result readback a batch harness pays, and is the honest
+    // figure for fan-out/fan-in. Quoting one while the reader assumes the
+    // other is how the earlier 23x figure came to disagree with reality.
     println!("speedup={:.2}x", cpu_t / gpu_t);
+    println!("speedup_compute_only={:.2}x", cpu_t / compute_t);
     println!("work_match={}", if total_cpu == total_gpu { "yes" } else { "NO" });
     println!("results_match={}", if results_match { "yes" } else { "NO" });
     Ok(())

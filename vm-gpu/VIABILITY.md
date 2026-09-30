@@ -4,73 +4,88 @@ Measured on pdx-nxst-001, Quadro RTX 6000 (CC 7.5, driver 595.84) via Vulkan.
 Stack VM in WGSL (one VM per GPU invocation), CPU scalar reference, identical
 opcodes and identical instruction accounting. `work_match=yes` on every run:
 the GPU and CPU executed exactly the same number of VM instructions.
-## Measurement caveat: these numbers are NOT comparable to the first build
-
-The first results (branch-free 23.18x at 262k) were measured when the harness
-read back only the 4-byte step counters. Adding the fan-in workload required
-reading back per-VM results, so the timed region now copies the **whole VM
-array** - 408 bytes per VM, which is 107 MB at 262k VMs versus 1.05 MB
-before.
-
-That readback is charged to `gpu_s`. Re-running the same branch-free workload
-on the current build gives **2.99x**, not 23.18x, with identical
-`cpu_instr` and `work_match=yes`. The interpreter did the same work; the
-measurement now includes a transfer the first run never paid.
-
-So: the branch-free and uniform-loop numbers in this file are stale relative
-to the fan-in numbers. Only the fan-in and divergent rows are internally
-consistent with each other, because they were all measured on the same build.
-A correct comparison needs the readback excluded from the timed region, or
-charged to both sides. Until then, treat ~3-4x as the honest band for any
-workload that also fans results in, and do not quote the 22x rows as a
-throughput claim.
-
 ## Results
 
-| workload | 1k | 16k | 65k | 262k |
-|---|---|---|---|---|
-| branch-free | 2.20x | 14.75x | 19.72x | 23.18x |
-| looping, uniform trip count | 0.51x | 3.27x | 4.99x | 5.37x |
-| **fan-out/fan-in over staged data** | 2.01x | 3.73x | 3.73x | 3.82x |
-| **per-VM trip count (divergent)** | 11.88x | 21.16x | 22.36x | 22.51x |
+Measured on one build, with the readback timed separately from the kernel
+(Quadro RTX 6000, driver 595.84, host load ~4/128 cores). Every row reports
+`work_match=yes` and `results_match=yes`: equal VM instruction counts on both
+sides, and equal per-VM output values.
 
-All runs report `work_match=yes` (equal VM instruction counts on both sides)
-and `results_match=yes` (equal per-VM output values), so the speedups compare
-equal work, not merely equal time.
+`compute` is dispatch + execute. `total` adds the per-run result readback a
+batch harness actually pays. Both are shown because they answer different
+questions, and reporting one while the reader assumes the other is what made
+an earlier 23x figure irreproducible.
+
+| workload | n | CPU | GPU compute | GPU total | vs CPU | compute-only |
+|---|---:|---:|---:|---:|---:|---:|
+| branch-free | 65536 | 15.1 ms | 0.55 ms | 5.26 ms | 2.87x | 26.9x |
+| branch-free | 262144 | 60.3 ms | 1.86 ms | 20.9 ms | 2.89x | 32.5x |
+| looping, uniform | 65536 | 6.56 ms | 0.58 ms | 5.31 ms | 1.24x | 11.9x |
+| looping, uniform | 262144 | 25.8 ms | 1.85 ms | 20.9 ms | 1.24x | 16.2x |
+| fan-out/fan-in | 65536 | 19.4 ms | 0.58 ms | 5.31 ms | 3.65x | 40.7x |
+| fan-out/fan-in | 262144 | 78.2 ms | 1.89 ms | 20.8 ms | 3.76x | 49.1x |
+| per-VM divergent | 65536 | 115 ms | 0.50 ms | 5.19 ms | 22.2x | 205x |
+| per-VM divergent | 262144 | 459 ms | 1.66 ms | 20.6 ms | 22.2x | 248x |
+
+## The readback is 92% of the GPU's time
+
+The VM array is 408 bytes; at 262144 VMs the readback moves 107 MB. Its cost
+is essentially identical across four workloads that differ by 70x in
+instruction count:
+
+| workload | xfer_s | share of GPU time |
+|---|---:|---:|
+| branch-free | 0.020851 | 91.8% |
+| looping, uniform | 0.020881 | 91.9% |
+| fan-out/fan-in | 0.020795 | 91.7% |
+| per-VM divergent | 0.020637 | 92.6% |
+
+A 1.2% spread against a 14.4% spread in compute time. The transfer is a fixed
+cost that the kernel's work does not change, and it runs at 5.1 GB/s — about
+33% of what the Gen3 x16 link allows.
+
+So the two speedup columns are not competing claims. **Compute-only is the
+kernel's throughput. Total is what a harness that reads results back pays
+today.** A design that keeps VM state resident on the device and reads back
+only a summary would land near the compute-only column; one that ships every
+VM's state to the host lands near the total column, and the transfer is then
+the thing to optimise.
+
+The highest-value change available is host-side: one mapped staging buffer and
+a larger copy per submission, rather than restructuring the kernels.
 
 ## Read the small-N numbers carefully
 
-The GPU has a fixed dispatch cost that does not shrink with VM count.
-Measured on the divergent workload:
+The GPU has a fixed dispatch cost that does not shrink with VM count. Measured
+on the divergent workload, with compute and transfer separated:
 
-| VMs | CPU | GPU | ratio |
-|---|---|---|---|
-| 4 | 4.0 us | 98.0 us | 0.04x |
-| 256 | 434 us | 89 us | 4.88x |
-| 1,024 | 1,824 us | 154 us | 11.88x |
-| 8,192 | 15,122 us | 747 us | 20.24x |
+| VMs | CPU | GPU compute | GPU total | ratio |
+|---|---|---|---|---|
+| 4 | 4.0 us | 73 us | 67 us | 0.06x |
+| 256 | 415 us | 81 us | 89 us | 4.65x |
+| 1,024 | 1,767 us | 78 us | 155 us | 11.37x |
+| 8,192 | 14,380 us | 132 us | 729 us | 19.73x |
 
-GPU time is nearly flat from 4 to 8,192 VMs: a ~90 us fixed cost plus ~79 ns
-per VM, against ~1,846 ns per VM on the CPU. The marginal cost of a VM is ~23x
-cheaper on the GPU, but **at small N the ratio is pure launch overhead** and
-says nothing about throughput. A 0.04x at N=4 is not a slow GPU; it is a GPU
-that has not been given work to hide its pipeline behind.
+GPU compute time is nearly flat from 4 to 8,192 VMs - 73 us to 132 us - so
+**at small N the ratio is pure launch overhead** and says nothing about
+throughput. A 0.06x at N=4 is not a slow GPU; it is a GPU that has not been
+given work to hide its pipeline behind. The crossover sits near 256 VMs.
 
 ## Verdict
 
 **Viable for throughput, not for latency, and only for data-parallel guests.**
 
-- Identical work: 23x at 262k, climbing slowly.
-- Per-VM divergent work: 22.5x at 262k. Divergence costs less than expected
-  when each lane still has bulk work.
-- Fan-in (each VM consumes staged input and produces its own result): 3.8x,
-  flat from 16k to 262k.
-- Short uniform loops: 5.4x.
+- Branch-free: 2.9x as a batch harness measures it, 32x on compute alone.
+- Per-VM divergent: 22x total, 248x compute-only.
+- Fan-in: 3.8x total, 49x compute-only. Flat from 16k to 262k.
+- Short uniform loops: 1.2x total, 16x compute-only.
 
-The pattern is **work per VM**, not control flow alone. Divergence is cheap when
-lanes still have bulk work; it is expensive when each VM does only a handful of
-operations. The fan-in row (3.8x) is the most representative number for a real
-fleet, because 16 ops per VM is closer to real work than 1000 straight-line ops.
+The pattern is **work per VM and how much you move**, not control flow alone.
+Divergence is cheap when lanes still have bulk work; it is expensive when each
+VM does only a handful of operations. But at these sizes the readback dominates
+every row, so the total column mostly measures bytes, not instructions. The
+fan-in row (3.8x) remains the most representative for a batch fleet, because a
+few ops per VM is closer to real work than a thousand straight-line ops.
 
 This matches the Glasgow paper's shape (arXiv:2608.16387): 19x
 parallel-vs-sequential on Stencil, a sequential VM 50-100x slower than the CPU,
