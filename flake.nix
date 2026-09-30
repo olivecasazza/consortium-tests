@@ -22,7 +22,7 @@
       # HTTPS, not SSH: Nix Checks runs on a GitHub-hosted runner that holds no
       # key for this host, and the repo is public, so the fetch must not need
       # one. The ref/rev pin is what matters; the transport is incidental.
-      url = "git+https://github.com/olivecasazza/consortium?ref=feat/fanout-vm-harness&rev=850247da6ac4a09aa377fe96993126334304db34";
+      url = "git+https://github.com/olivecasazza/consortium?ref=feat/cascade-copy-jsonl&rev=98b99542536accb73b5234cca1f631d73eebd554";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Claude Code plugin marketplace of hand-crafted agent skills, vendored at
@@ -104,6 +104,7 @@
                 --store-path ${fanout.defaultPayload} \
                 --expect-stdout 'Hello, world!\n' \
                 --ready-probe-binary ${fanout.probeBinary} \
+                --cascade-tree-module ${./nix/fanout-vms/cascade_tree.py} \
                 "$@"
             '';
           };

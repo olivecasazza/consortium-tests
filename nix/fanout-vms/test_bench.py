@@ -396,6 +396,7 @@ def parse_harness_args(expect_stdout: str = "x") -> Any:
                     "--store-path", str(payload),
                     "--expect-stdout", expect_stdout,
                     "--ready-probe-binary", "/nix/store/xyz-probe/bin/fanout-probe",
+                    "--cascade-tree-module", "/nix/store/xyz-cascade-tree.py",
                     "--count", "2",
                 ]
             )
