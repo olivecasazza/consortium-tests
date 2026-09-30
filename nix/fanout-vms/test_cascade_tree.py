@@ -404,5 +404,135 @@ class RelayWasUsedTest(unittest.TestCase):
             tree.assert_relay_was_used(topology, fanout=2)
 
 
+class MalformedStreamTest(unittest.TestCase):
+    """Every way a stream can be wrong, each one named rather than swallowed.
+
+    These are the branches a cascade checker lives or dies on: a truncated
+    capture, a line that is not JSON, a line that is JSON but not an object,
+    and blank padding. Each must produce a distinct, diagnosable error, and
+    each must name the line so a 40k-line capture is still debuggable.
+    """
+
+    def test_a_line_that_is_not_json_names_its_line_number(self) -> None:
+        # A capture truncated mid-write leaves a half-flushed final line. It
+        # has to fail as a parse error at that line, not as a silently short
+        # tree that later reads as "converged everything we happened to see".
+        for corrupt in ["{not json", '{"kind":', "not json at all"]:
+            with self.subTest(corrupt=corrupt):
+                events = "\n".join([
+                    json.dumps(started(2, [0])),
+                    json.dumps(edge_completed(0, 0, 1)),
+                    corrupt,
+                ]) + "\n"
+                with self.assertRaisesRegex(tree.CascadeTreeError, "is not JSON") as caught:
+                    tree.parse_cascade_events(events)
+                # The message has to name the line, or a 40k-line capture is
+                # undebuggable. The corrupt record is the third line.
+                self.assertIn("line 3", str(caught.exception))
+
+    def test_a_json_line_that_is_not_an_object_is_rejected(self) -> None:
+        # `[1,2]` and `"done"` parse as JSON but carry no `kind`, so treating
+        # them as events would silently drop a line from the topology.
+        for payload in ["[1, 2]", '"done"', "42", "null"]:
+            with self.subTest(payload=payload):
+                events = "\n".join([
+                    json.dumps(started(2, [0])),
+                    json.dumps(edge_completed(0, 0, 1)),
+                    payload,
+                    json.dumps(finished(2, 0, 1)),
+                ]) + "\n"
+                with self.assertRaisesRegex(tree.CascadeTreeError, "not a JSON object") as caught:
+                    tree.parse_cascade_events(events)
+                self.assertIn("line 3", str(caught.exception))
+
+    def test_blank_lines_are_padding_not_events(self) -> None:
+        # `cascade-copy` output is concatenated from several sources, so blank
+        # lines between records are normal and must not count as events.
+        events = "\n\n".join([
+            json.dumps(started(4, [0])),
+            json.dumps(edge_completed(0, 0, 1)),
+            json.dumps(edge_completed(0, 0, 2)),
+            json.dumps(edge_completed(1, 1, 3)),
+            json.dumps(finished(4, 0, 2)),
+        ]) + "\n\n"
+        topology = tree.parse_cascade_events(events)
+        self.assertEqual(4, topology.n_nodes)
+        self.assertEqual(2, topology.rounds)
+        self.assertEqual({1: 0, 2: 0, 3: 1}, topology.parent)
+
+    def test_a_child_of_an_unserved_node_is_left_out_rather_than_looping(self) -> None:
+        # A cycle would hang a naive depth walk. `_depths` skips a node whose
+        # source has no depth, so a node reachable only through the cycle is
+        # absent from `depth_of` rather than looping forever. 5 nodes at
+        # fanout 2 leaves 4 pending, more than the seed could serve alone, so
+        # the relay verdict is reached rather than returning early.
+        events = jsonl([
+            started(5, [0]),
+            edge_completed(0, 0, 1),
+            edge_completed(0, 0, 2),
+            edge_completed(1, 0, 3),
+            edge_completed(1, 4, 4),
+            finished(4, 0, 2),
+        ])
+        topology = tree.parse_cascade_events(events)
+        # Node 4 was served by node 4: the edge exists, so the unserved check
+        # is satisfied, but the depth walk cannot reach it from the seed and
+        # must leave it out rather than looping on the cycle.
+        self.assertIn(4, topology.parent)
+        self.assertNotIn(4, topology.depth_of)
+        # Node 3 is served by the seed, so its depth is 1.
+        self.assertEqual({0: 0, 1: 1, 2: 1, 3: 1}, topology.depth_of)
+        # The cycle is therefore not counted as relay depth, which is what
+        # makes the host-push verdict below correct rather than accidental.
+        self.assertEqual(1, topology.depth)
+        with self.assertRaisesRegex(tree.CascadeTreeError, "not relayed"):
+            tree.assert_relay_was_used(topology, fanout=2)
+
+
+class ExpectedDepthEdgeTest(unittest.TestCase):
+    """The round count's boundaries, where an off-by-one hides."""
+
+    def test_a_fully_seeded_fleet_needs_no_rounds(self) -> None:
+        # Nothing is pending, so no round is needed. Getting this wrong would
+        # demand a round from a fleet that converged before starting.
+        events = jsonl([started(3, [0, 1, 2]), finished(3, 0, 0)])
+        topology = tree.parse_cascade_events(events)
+        self.assertEqual(0, topology.expected_depth(fanout=2))
+
+    def test_a_fanout_below_one_is_rejected(self) -> None:
+        for bad_fanout in (0, -1):
+            with self.subTest(fanout=bad_fanout):
+                events = jsonl([started(4, [0]), finished(4, 0, 1)])
+                topology = tree.parse_cascade_events(events)
+                with self.assertRaisesRegex(tree.CascadeTreeError, "at least 1"):
+                    topology.expected_depth(fanout=bad_fanout)
+
+    def test_a_fanout_of_one_cannot_converge_and_says_so(self) -> None:
+        # A fanout of 1 delivers one node per round, so a fleet larger than
+        # the seed set never finishes. Reporting a round count here would let
+        # an unconvergeable cascade be called good.
+        events = jsonl([started(4, [0]), finished(4, 0, 1)])
+        topology = tree.parse_cascade_events(events)
+        with self.assertRaisesRegex(tree.CascadeTreeError, "fanout of 1"):
+            topology.expected_depth(fanout=1)
+
+    def test_the_round_count_matches_a_hand_computed_geometric_sum(self) -> None:
+        # Round k delivers fanout**k, so the answer is the smallest k whose
+        # cumulative delivery covers the pending nodes. Computed here by
+        # accumulating, independently of the closed form in the module.
+        for n_nodes, fanout in [(7, 2), (8, 2), (9, 2), (15, 2), (16, 2),
+                                (64, 2), (65, 2), (9, 3), (10, 3), (17, 4)]:
+            with self.subTest(n_nodes=n_nodes, fanout=fanout):
+                pending = n_nodes - 1
+                delivered, rounds = 0, 0
+                while delivered < pending:
+                    rounds += 1
+                    delivered += fanout**rounds
+                events = jsonl([started(n_nodes, [0]),
+                                finished(n_nodes, 0, rounds)])
+                topology = tree.parse_cascade_events(events)
+                self.assertEqual(rounds, topology.expected_depth(fanout=fanout))
+
+
 if __name__ == "__main__":
     unittest.main()
