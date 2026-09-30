@@ -4,6 +4,27 @@ Measured on pdx-nxst-001, Quadro RTX 6000 (CC 7.5, driver 595.84) via Vulkan.
 Stack VM in WGSL (one VM per GPU invocation), CPU scalar reference, identical
 opcodes and identical instruction accounting. `work_match=yes` on every run:
 the GPU and CPU executed exactly the same number of VM instructions.
+## Measurement caveat: these numbers are NOT comparable to the first build
+
+The first results (branch-free 23.18x at 262k) were measured when the harness
+read back only the 4-byte step counters. Adding the fan-in workload required
+reading back per-VM results, so the timed region now copies the **whole VM
+array** - 408 bytes per VM, which is 107 MB at 262k VMs versus 1.05 MB
+before.
+
+That readback is charged to `gpu_s`. Re-running the same branch-free workload
+on the current build gives **2.99x**, not 23.18x, with identical
+`cpu_instr` and `work_match=yes`. The interpreter did the same work; the
+measurement now includes a transfer the first run never paid.
+
+So: the branch-free and uniform-loop numbers in this file are stale relative
+to the fan-in numbers. Only the fan-in and divergent rows are internally
+consistent with each other, because they were all measured on the same build.
+A correct comparison needs the readback excluded from the timed region, or
+charged to both sides. Until then, treat ~3-4x as the honest band for any
+workload that also fans results in, and do not quote the 22x rows as a
+throughput claim.
+
 ## Results
 
 | workload | 1k | 16k | 65k | 262k |
