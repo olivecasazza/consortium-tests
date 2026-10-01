@@ -10,18 +10,18 @@ name: Review Gate
 #   items  — derive items.json from the PR's changed files and patches
 #            (.github/scripts/pr_review_items.py, unit tested via the
 #            checks.ci-scripts-test flake check)
+#   config — single decision point: armed iff ZAI_API_KEY is configured
 #   review — the reusable ai-item-review workflow asks a Z.AI GLM model for
-#            a strict-JSON review plan. continue-on-error: a model or
-#            secret failure alone must never redden the PR — the gate job
-#            below owns blocking-ness.
+#            a strict-JSON review plan; skipped entirely while unarmed
+#            (reusable-workflow-call jobs cannot carry continue-on-error)
 #   gate   — validate the returned plan's shape fail-loud
 #            (.github/scripts/review_plan_check.py, also unit tested) and
-#            render the findings into the run summary.
+#            render the findings into the run summary
 #
-# Blocking vs advisory: the gate fails the run only when ZAI_API_KEY is
-# configured on the repository. Until then it is advisory — it runs,
-# validates, and reports as a warning, but cannot block a merge. Adding
-# the secret flips it to blocking with no wiring change.
+# Blocking vs advisory: the gate fails the run only when armed. While
+# ZAI_API_KEY is unset the gate is advisory — it runs, validates whatever
+# exists, and reports a warning, but cannot block a merge. Adding the
+# secret flips it to blocking with no wiring change.
 
 on:
   pull_request:
@@ -43,6 +43,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Single decision point for blocking vs advisory: armed iff ZAI_API_KEY
+  # is configured. Reusable-workflow-call jobs cannot carry
+  # continue-on-error, so the review job is skipped when unarmed instead.
+  config:
+    name: Gate configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      armed: ${{ steps.decide.outputs.armed }}
+    steps:
+      - name: Check whether ZAI_API_KEY is configured
+        id: decide
+        env:
+          # Presence test only — the key value never reaches the log.
+          ARMED: ${{ secrets.ZAI_API_KEY != '' }}
+        run: |
+          if [ "$ARMED" = "true" ]; then
+            echo "armed=true" >> "$GITHUB_OUTPUT"
+            echo "ZAI_API_KEY is configured — review gate is BLOCKING"
+          else
+            echo "armed=false" >> "$GITHUB_OUTPUT"
+            echo "ZAI_API_KEY is NOT configured — review gate is ADVISORY (non-blocking) until the secret is added"
+          fi
+
   items:
     name: Derive review items
     runs-on: ubuntu-latest
@@ -66,8 +90,8 @@ jobs:
 
   review:
     name: AI review (model call)
-    needs: items
-    continue-on-error: true
+    needs: [items, config]
+    if: needs.config.outputs.armed == 'true'
     uses: ./.github/workflows/ai-item-review.yml
     with:
       items_artifact: pr-review-items
@@ -111,7 +135,7 @@ jobs:
 
   gate:
     name: Review plan gate
-    needs: [items, review]
+    needs: [items, review, config]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -136,8 +160,7 @@ jobs:
 
       - name: Validate plan shape (fail loud when the gate is armed)
         env:
-          # Presence test only — the key value never reaches the log.
-          GATE_ARMED: ${{ secrets.ZAI_API_KEY != '' }}
+          GATE_ARMED: ${{ needs.config.outputs.armed }}
         run: |
           if python3 .github/scripts/review_plan_check.py \
               --plan plan/plan.json --items items/items.json; then
