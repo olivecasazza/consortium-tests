@@ -55,6 +55,7 @@
       inherit (nixpkgs) lib;
       supportedSystems = [
         "aarch64-darwin"
+        "aarch64-linux"
         "x86_64-linux"
       ];
 
@@ -186,9 +187,31 @@
               }
               ''
                 export PYTHONDONTWRITEBYTECODE=1
-                cp -r ${./nix/fanout-vms} fanout-vms
-                chmod -R u+w fanout-vms
-                python -m unittest discover -s fanout-vms -p 'test_*.py' -v
+                # Keep the nix/fanout-vms nesting and ship the root flake. The
+                # platform-agreement tests read supportedSystems from
+                # Path(__file__).parents[2]/flake.nix; flattening the copy put
+                # that path outside the sandbox, so the check failed on a file
+                # it had never been given.
+                mkdir -p nix
+                cp -r ${./nix/fanout-vms} nix/fanout-vms
+                cp ${./flake.nix} flake.nix
+                chmod -R u+w nix flake.nix
+                python -m unittest discover -s nix/fanout-vms -p 'test_*.py' -v
+                touch $out
+              '';
+          # CI helper scripts (.github/scripts): the PR review gate's pure
+          # logic — items derivation and plan shape validation — is unit
+          # tested here so a review-gate regression cannot land unnoticed.
+          checks.ci-scripts-test =
+            pkgs.runCommand "consortium-ci-scripts-test"
+              {
+                nativeBuildInputs = [ python ];
+              }
+              ''
+                export PYTHONDONTWRITEBYTECODE=1
+                cp -r ${./.github/scripts} ci-scripts
+                chmod -R u+w ci-scripts
+                python -m unittest discover -s ci-scripts/tests -p 'test_*.py' -v
                 touch $out
               '';
           devShells.default = pkgs.mkShell {

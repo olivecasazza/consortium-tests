@@ -106,6 +106,18 @@ commit; the defaults are this checkout and `BASE_REV` below. The Apple leg
 needs the aarch64-linux builder, `nix/fanout-vms/linux-builder.nix`, which the
 driver names if it is not listening on `:31022`.
 
+`FANOUT_LINUX_HOST` and `FANOUT_LINUX_SYSTEM` name the target of the Linux leg,
+and the fleet spans two architectures: `pdx-nxst-001`/`-003` are `x86_64-linux`
+and `pdx-nxmm-01`/`-02`/`-03` are `aarch64-linux`. A system the flake does not
+build for is refused before the build rather than built for and pushed to a
+host that cannot run it, so the two are set together:
+
+```sh
+FANOUT_LINUX_HOST=root@pdx-nxmm-01.schrodinger.com \
+FANOUT_LINUX_SYSTEM=aarch64-linux \
+FANOUT_PLATFORMS=linux nix/fanout-vms/run.sh
+```
+
 There is no copy of the harness in any other repo, and there should not be:
 harness and driver both live here.
 
@@ -188,6 +200,19 @@ Every run also reports `state_isolation_verified` and
 `ssh_data_exchange_verified` at 64, so a green run means the restored
 guests are genuinely independent and exchanging real data - not merely that
 64 sockets accepted a connection.
+
+**Each node re-probes its NIC inside the readiness window.** A restored guest
+resumes the capture's kernel state, and the kernel reads a NIC address once,
+when the driver probes the device, and keeps it from then on - so every node
+would answer with the capture guest's address even though QEMU holds a distinct
+one per launch. The run therefore unbinds and rebinds `virtio_net` on each node
+so the driver reads the device again, which costs the node its network for
+about a second. A new MAC is a new client to slirp's DHCP server, so the guest
+is re-leased a different address, and the run follows it: each guest reports
+where it landed to the host through slirp's gateway, and the host re-aims that
+node's SSH and health forwards at it. The step is inside `readiness_s` rather
+than beside it, because a node that cannot be asked its address is a node the
+run has not finished bringing up.
 
 **Snapshot restore, not boot tuning, is what made this pass.** Everything below
 documents the cold-boot path: it is what produced the 20.8 s figure and the

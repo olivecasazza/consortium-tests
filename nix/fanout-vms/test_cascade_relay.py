@@ -772,5 +772,85 @@ class CascadeStepTest(unittest.TestCase):
                         )
 
 
+class CascadeEvidenceTest(unittest.TestCase):
+    """A failed relay check must leave the stream behind.
+
+    `run_checked` already truncates a command's output in the error it
+    raises, so a rejected cascade used to leave only the tail - three events,
+    the last one of which says everything and none of which says why. The whole
+    point of the check is that a cascade that quietly degenerates is
+    diagnosable, and a truncated tail is not.
+    """
+
+    def test_the_stream_is_written_even_when_the_command_itself_fails(self) -> None:
+        """The case that hid this bug for a whole diagnosis.
+
+        `cascade-copy` exits non-zero on a cascade that failed, and
+        `run_checked` raises before returning — so writing the stream after it
+        returns wrote nothing, and the one run that mattered left a
+        three-event tail instead of the 126-event stream that showed every peer
+        edge failing. The evidence has to be taken before the raise.
+        """
+        import subprocess as sp
+        import tempfile
+
+        stream = host_push_stream(8)
+        ok = sp.CompletedProcess([], 0, stdout="", stderr="")
+        failed = sp.CompletedProcess([], 1, stdout=stream, stderr="cascade-copy: boom")
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp)
+            # The inventory upload succeeds; the cascade is what fails.
+            with mock.patch.object(bench.subprocess, "run", side_effect=[ok, failed]):
+                with self.assertRaises(bench.HarnessError):
+                    bench.run_cascade(
+                        ssh_key=Path("/dev/null"),
+                        store_path=Path("/nix/store/abc"),
+                        inventory_content="seed = 'root@127.0.0.1'\n",
+                        count=8,
+                        fanout=2,
+                        evidence_dir=evidence,
+                    )
+            self.assertTrue((evidence / "cascade-events.jsonl").is_file(),
+                            "a failing cascade must still leave its stream")
+
+    def test_the_captured_stream_is_written_even_when_the_check_fails(self) -> None:
+        import tempfile
+
+        completed = SimpleNamespace(returncode=0, stdout=host_push_stream(64), stderr="")
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp)
+            with mock.patch.object(bench, "run_checked", return_value=completed):
+                with self.assertRaises(bench.HarnessError):
+                    bench.run_cascade(
+                        ssh_key=Path("/dev/null"),
+                        store_path=Path("/nix/store/abc"),
+                        inventory_content="seed = 'root@127.0.0.1'\n",
+                        count=64,
+                        fanout=2,
+                        evidence_dir=evidence,
+                    )
+            written = list(evidence.glob("*"))
+            self.assertTrue(written, "no evidence written for a failed relay check")
+            events = [
+                json.loads(line)
+                for f in written
+                for line in f.read_text().splitlines()
+                if line.strip()
+            ]
+            # The round count is the diagnosis: 63 rounds for 64 nodes is a
+            # serial push, not a log-2 relay, and that is only visible in the
+            # full stream.
+            finished = [e for e in events if e["kind"] == "finished"]
+            self.assertEqual(1, len(finished))
+            # A star converges in one round. The real 64-node run took 63 and
+            # looked exactly like this, one seed-served edge at a time.
+            self.assertEqual(1, finished[0]["rounds"])
+            self.assertEqual(
+                {0},
+                {e["src"] for e in events if e["kind"] == "edge_completed"},
+                "every node was served by the seed, which is the defect",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
