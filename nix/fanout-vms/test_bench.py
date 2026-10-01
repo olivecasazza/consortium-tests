@@ -423,7 +423,6 @@ def parse_harness_args(
                     "--store-path", str(payload),
                     "--expect-stdout", expect_stdout,
                     "--ready-probe-binary", "/nix/store/xyz-probe/bin/fanout-probe",
-                    "--cascade-tree-module", "/nix/store/xyz-cascade-tree.py",
                     "--count", str(count),
                     *extra,
                 ]
@@ -560,6 +559,90 @@ class FleetEntropyIndependenceTest(unittest.TestCase):
             ],
             [c[-1] for c in seen],
         )
+
+
+class CascadeVerifierCallTest(unittest.TestCase):
+    """The relay proof comes from `cast cascade verify`, an external process.
+
+    These tests point the checker at fake verifier executables and hold the
+    harness to its side of the contract: hand over the whole event stream and
+    the fleet parameters, translate the verdict, and fail the run on every way
+    verification can fail — including the verifier being absent or speaking
+    nonsense. No failure path may read as "relay fine", and each must name its
+    cause. (The stream semantics themselves — relay vs host push, round rules
+    — are the real verifier's job and are swept against it in
+    test_cascade_relay.py.)
+    """
+
+    def _write_verifier(self, body: str) -> str:
+        """A fake `cast` executable with the given shell body."""
+        directory = tempfile.mkdtemp(prefix="fake-cast-")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = Path(directory) / "cast"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return str(path)
+
+    def _verify(self, stream: str, verifier: str, **kwargs: int) -> dict:
+        return bench.verify_cascade_relay(
+            stream, count=kwargs.get("count", 64), fanout=kwargs.get("fanout", 2),
+            verifier=verifier,
+        )
+
+    def test_a_verifier_summary_becomes_the_run_topology(self) -> None:
+        verifier = self._write_verifier(
+            "printf '%s\\n' "
+            "'{\"nodes\": 64, \"rounds\": 6, \"relay_depth\": 6, "
+            "\"relayed_nodes\": 63}'"
+        )
+        summary = self._verify("started line\n", verifier)
+        self.assertEqual(64, summary["nodes"])
+        self.assertEqual(6, summary["rounds"])
+        self.assertEqual(6, summary["relay_depth"])
+        self.assertEqual(63, summary["relayed_nodes"])
+        for value in summary.values():
+            self.assertIsInstance(value, int)
+
+    def test_the_verifier_receives_the_stream_and_the_fleet_parameters(self) -> None:
+        # Rejects (exit 9) unless invoked as: cast cascade verify <trace>
+        # --fanout <fanout> --nodes <count>. Passing proves the checker feeds
+        # the verifier the invocation the real CLI expects.
+        verifier = self._write_verifier(
+            '[ "$1" = "cascade" ] && [ "$2" = "verify" ] || exit 9\n'
+            '[ "$4" = "--fanout" ] && [ "$5" = "4" ] || exit 9\n'
+            '[ "$6" = "--nodes" ] && [ "$7" = "8" ] || exit 9\n'
+            "echo '{\"nodes\": 8, \"rounds\": 3, \"relay_depth\": 3, "
+            "\"relayed_nodes\": 7}'\n"
+        )
+        summary = self._verify(
+            "started line\n", verifier, count=8, fanout=4
+        )
+        self.assertEqual(8, summary["nodes"])
+
+    def test_a_missing_verifier_fails_the_run(self) -> None:
+        absent = "/nonexistent/bin/cast-missing"
+        with self.assertRaises(bench.HarnessError) as caught:
+            self._verify("started line\n", absent)
+        message = str(caught.exception)
+        self.assertIn("cast-missing", message)
+        self.assertIn("PATH", message)
+
+    def test_a_failing_verifier_fails_the_run_with_its_diagnostic(self) -> None:
+        verifier = self._write_verifier(
+            "echo 'cascade relay check failed: the payload was not relayed' >&2\n"
+            "exit 3\n"
+        )
+        with self.assertRaises(bench.HarnessError) as caught:
+            self._verify("started line\n", verifier)
+        message = str(caught.exception)
+        self.assertIn("exit 3", message)
+        self.assertIn("not relayed", message)
+
+    def test_unparseable_verifier_output_is_a_failure_not_a_pass(self) -> None:
+        verifier = self._write_verifier("echo verifier-ok\n")
+        with self.assertRaises(bench.HarnessError) as caught:
+            self._verify("started line\n", verifier)
+        self.assertIn("unparseable", str(caught.exception))
 
 
 class PerVmGuestAddressTest(unittest.TestCase):
@@ -2971,7 +3054,6 @@ class RealRunnerNicLookupTest(unittest.TestCase):
                 deadline,
             )
         self.assertIn("after it was realized", str(caught.exception))
-
 
 
 if __name__ == "__main__":

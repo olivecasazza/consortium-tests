@@ -13,17 +13,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1790748773,
-        "narHash": "sha256-Qp2hDC0QVmW0oqeL5cQ76Qu0Jhev5ATdO3iuAI/N8C8=",
+        "lastModified": 1790865054,
+        "narHash": "sha256-DsHua96zMZ1Aet/1u10y0rghuF1vvHGW4wixirkRSP8=",
         "ref": "master",
-        "rev": "799541f9c47117b9b9c513633d1f5c925abe6650",
-        "revCount": 1070,
+        "rev": "d96f964dc16f932a24a36fb4caf737291866c9d8",
+        "revCount": 1082,
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       },
       "original": {
         "ref": "master",
-        "rev": "799541f9c47117b9b9c513633d1f5c925abe6650",
+        "rev": "d96f964dc16f932a24a36fb4caf737291866c9d8",
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       }

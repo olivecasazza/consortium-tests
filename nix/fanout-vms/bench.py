@@ -7,7 +7,6 @@ import argparse
 import concurrent.futures
 import functools
 import hashlib
-import importlib.util
 import http.client
 import json
 import os
@@ -184,35 +183,6 @@ class BenchmarkFailed(HarnessError):
     def __init__(self, message: str, report: dict[str, Any]) -> None:
         super().__init__(message)
         self.report = report
-
-
-def load_cascade_tree_module(path: Path) -> Any:
-    """Load the cascade topology verifier from an explicit path.
-
-    `flake.nix` copies this file into the store on its own, so a sibling file
-    is not beside it at runtime: a copied file's store path is `<hash>-<name>`,
-    which no plain `import` resolves. Every other input here is passed in as a
-    store path for the same reason, and the verifier is no different.
-
-    Not cached: it is a few hundred lines of pure Python loaded once per run,
-    and a module-level cache keyed on nothing makes the result depend on which
-    path happened to be loaded first.
-    """
-    spec = importlib.util.spec_from_file_location("cascade_tree", path)
-    if spec is None or spec.loader is None:
-        raise HarnessError(f"cannot load cascade_tree module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    # Register before executing: `@dataclass` resolves
-    # `sys.modules[cls.__module__]`, so a dataclass module loaded without this
-    # dies inside the dataclass machinery with an error about `NoneType`, which
-    # says nothing about the real cause.
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except OSError as error:
-        del sys.modules[spec.name]
-        raise HarnessError(f"cannot read cascade_tree module at {path}: {error}") from error
-    return module
 
 
 @dataclass
@@ -463,17 +433,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "the relay check rejects the run. It must survive the run: the "
             "fleet's own scratch directory is removed during cleanup, which "
             "is exactly when the evidence matters most"
-        ),
-    )
-    parser.add_argument(
-        "--cascade-tree-module",
-        required=True,
-        type=Path,
-        help=(
-            "the cascade topology verifier to load from this store path. It is "
-            "a separate file and this one is packaged alone, so it cannot be "
-            "imported as a sibling: a copied file's store path is "
-            "<hash>-<name>, which no plain import resolves"
         ),
     )
     parser.add_argument(
@@ -1312,32 +1271,76 @@ def cascade_command(store_path: Path, inventory: str, *, fanout: int) -> str:
 
 
 def verify_cascade_relay(
-    stream: str, module: Any, *, count: int, fanout: int
+    stream: str, *, count: int, fanout: int, verifier: str = "cast"
 ) -> dict[str, int]:
     """Assert the cascade really relayed, and describe the tree it built.
 
-    The CLI's exit status cannot tell a peer-to-peer cascade from a host that
-    pushed to every guest in turn: both exit 0. Only the tree can, so this
-    reads the run's own event stream and fails when no peer ever served
-    another.
-
-    `module` is the loaded cascade_tree verifier; it is passed in rather than
-    imported so the same code path serves the tests and the packaged harness.
+    `cast cascade verify` owns the stream grammar, the relay assertion, and
+    the round rule; this hands it the run's whole event stream and translates
+    its verdict. The CLI's exit status cannot tell a peer-to-peer cascade from
+    a host that pushed to every guest in turn — both exit 0 — so the verdict
+    comes from the verifier, and every way the verification can fail (binary
+    absent, non-zero exit, nonsense output) fails the run with the cause
+    named rather than reading as "relay fine".
     """
-    try:
-        topology = module.parse_cascade_events(stream)
-        module.assert_relay_was_used(topology, fanout=fanout)
-    except module.CascadeTreeError as error:
-        raise HarnessError(f"cascade relay check failed: {error}") from error
-    if topology.n_nodes != count:
-        raise HarnessError(
-            f"cascade covered {topology.n_nodes} nodes, expected {count}"
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".jsonl", prefix="cascade-trace-"
+    ) as trace:
+        trace.write(stream)
+        trace.flush()
+        try:
+            completed = subprocess.run(
+                [
+                    verifier,
+                    "cascade",
+                    "verify",
+                    trace.name,
+                    "--fanout",
+                    str(fanout),
+                    "--nodes",
+                    str(count),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=VERIFY_TIMEOUT_S,
+            )
+        except FileNotFoundError as error:
+            raise HarnessError(
+                f"cascade verifier {verifier!r} is not on PATH, so the relay "
+                "check cannot run"
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise HarnessError(
+                f"cascade verifier {verifier!r} did not finish within "
+                f"{VERIFY_TIMEOUT_S:.0f}s"
+            ) from error
+    if completed.returncode != 0:
+        diagnostic = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or "no diagnostic printed"
         )
+        raise HarnessError(
+            f"cascade verifier failed (exit {completed.returncode}): {diagnostic}"
+        )
+    try:
+        summary = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise HarnessError(
+            "cascade verifier exited 0 but printed unparseable output "
+            f"({error.msg}): {completed.stdout.strip()[:200]!r}"
+        ) from error
+    for field in ("nodes", "rounds", "relay_depth", "relayed_nodes"):
+        value = summary.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise HarnessError(
+                f"cascade verifier reported {field} as {value!r}, not an integer"
+            )
     return {
-        "nodes": topology.n_nodes,
-        "rounds": topology.rounds,
-        "relay_depth": topology.depth,
-        "relayed_nodes": len(topology.parent),
+        "nodes": summary["nodes"],
+        "rounds": summary["rounds"],
+        "relay_depth": summary["relay_depth"],
+        "relayed_nodes": summary["relayed_nodes"],
     }
 
 
@@ -1351,12 +1354,10 @@ def write_cascade_evidence(evidence_dir: Path | None, stream: str) -> None:
     except OSError as error:
         raise HarnessError(f"cannot record the cascade event stream: {error}") from error
 
-
 def run_cascade(
     ssh_key: Path,
     store_path: Path,
     inventory_content: str,
-    module: Any,
     *,
     count: int,
     fanout: int,
@@ -1386,7 +1387,6 @@ def run_cascade(
         # Runs inside run_checked, before it raises. Recording after the call
         # would be dead code: a non-zero exit never returns.
         write_cascade_evidence(evidence_dir, result.stdout)
-
     completed = run_checked(
         "guest cascade-copy",
         host_ssh_command(
@@ -1398,7 +1398,7 @@ def run_cascade(
         on_failure=record,
     )
     write_cascade_evidence(evidence_dir, completed.stdout)
-    return verify_cascade_relay(completed.stdout, module, count=count, fanout=fanout)
+    return verify_cascade_relay(completed.stdout, count=count, fanout=fanout)
 
 
 def assert_probe_file_is_durable(vm: VmProcess, ssh_key: Path) -> None:
@@ -1946,12 +1946,11 @@ def deploy_and_verify(
     vms: Sequence[VmProcess],
     ssh_key: Path,
     evidence_dir: Path | None,
-    cascade_tree_module: Path,
     store_path: Path,
     inventory_content: str,
     binary_relative_path: PurePosixPath,
     expected_stdout: str,
-) -> float:
+) -> tuple[float, dict[str, int]]:
     deployment_started = time.monotonic()
     encoded_key = urllib.parse.quote(str(ssh_key), safe="/")
     seed_uri = (
@@ -1975,7 +1974,6 @@ def deploy_and_verify(
         ssh_key,
         store_path,
         inventory_content,
-        load_cascade_tree_module(cascade_tree_module),
         count=len(vms),
         fanout=2,
         evidence_dir=evidence_dir,
@@ -2327,7 +2325,6 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             vms,
             ssh_key,
             args.evidence_dir,
-            args.cascade_tree_module,
             args.store_path,
             inventory_content,
             args.binary_relative_path,
@@ -2372,7 +2369,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 # Not the CLI's exit status: the tree the run actually built.
                 # A cascade that pushed host-to-each-guest exits 0 and would
                 # otherwise be recorded identically to a real fan-out.
-                "cascade_relay_verified": args.count,
+                "cascade_relay_verified": cascade_topology["relayed_nodes"],
                 "guest_gateway_relay": "ok",
                 "host_to_seed": "ok",
                 "payload_executions_verified": args.count,

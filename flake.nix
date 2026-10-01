@@ -14,15 +14,19 @@
 
     # The guest image embeds `consortium-cli` (for `cascade-copy`) and
     # exercises `consortium-nix` SSH-port parsing, so it needs the package
-    # built for the GUEST system, not a path dependency. Pinned to 850247da
-    # ("accept SSH ports in cascade source addresses"), not yet on master:
-    # relay sources are addressed as root@10.0.2.2:<port>, and without it
-    # every guest-sourced hop fails (only seed -> 2 children land).
+    # built for the GUEST system, not a path dependency. Pinned to d96f964d
+    # on master: the relay-source SSH-port fix ("keep a port in a fleet
+    # address off the ssh hostname", PR #23) is in, relay sources are
+    # addressed as root@10.0.2.2:<port> and every guest-sourced hop lands.
+    # The same rev supplies the HOST-side verifier, `cast cascade verify`,
+    # which the harness's relay check delegates to — one rev for the guest
+    # emitter and the host judge, so the two cannot drift apart on the wire
+    # format.
     consortium = {
       # HTTPS, not SSH: Nix Checks runs on a GitHub-hosted runner that holds no
       # key for this host, and the repo is public, so the fetch must not need
       # one. The ref/rev pin is what matters; the transport is incidental.
-      url = "git+https://github.com/olivecasazza/consortium?ref=master&rev=799541f9c47117b9b9c513633d1f5c925abe6650";
+      url = "git+https://github.com/olivecasazza/consortium?ref=master&rev=d96f964dc16f932a24a36fb4caf737291866c9d8";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Claude Code plugin marketplace of hand-crafted agent skills, vendored at
@@ -80,6 +84,14 @@
             doCheck = false;
           };
 
+          # The HOST-side half of the relay check: bench.py shells out to
+          # `cast cascade verify`, so the wrapper and the launcher-test
+          # sandbox both need this HOST-system build on PATH. Guest system on
+          # darwin, host system here — same package, different platform.
+          consortiumHostCli = consortium.packages.${system}.consortium-cli.overrideAttrs {
+            doCheck = false;
+          };
+
           fanout = import ./nix/fanout-vms {
             inherit inputs;
             hostSystem = system;
@@ -94,6 +106,7 @@
               python
               fanout.runner
               fanout.defaultPayload
+              consortiumHostCli
             ];
             meta.description = "Launch N independent microVMs and benchmark log2 Nix closure distribution";
             text = ''
@@ -105,7 +118,6 @@
                 --store-path ${fanout.defaultPayload} \
                 --expect-stdout 'Hello, world!\n' \
                 --ready-probe-binary ${fanout.probeBinary} \
-                --cascade-tree-module ${./nix/fanout-vms/cascade_tree.py} \
                 "$@"
             '';
           };
@@ -158,12 +170,19 @@
           # shutil.which. Without it the sandbox raises "ssh is not on PATH"
           # and three tests fail on the environment rather than on anything
           # they assert.
+          #
+          # The same logic pins the relay verifier: the relay-check oracle in
+          # test_cascade_relay.py runs every synthetic stream through the real
+          # `cast cascade verify`, so a sandbox without it would fail (never
+          # skip) every relay-check test on a missing binary rather than on
+          # anything it asserts.
           checks.fanout-bench-test =
             pkgs.runCommand "consortium-fanout-bench-test"
               {
                 nativeBuildInputs = [
                   python
                   pkgs.openssh
+                  consortiumHostCli
                 ];
               }
               ''
@@ -204,6 +223,9 @@
             packages = [
               pkgs.cargo
               pkgs.nix
+              # The relay-check tests shell out to the real verifier; without
+              # it they fail (never skip) on the missing binary.
+              consortiumHostCli
             ];
 
             shellHook = ''
