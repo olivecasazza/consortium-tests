@@ -24,7 +24,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import IO, Any, Sequence
+from typing import IO, Any, Callable, Sequence
 
 SSH_PORT_BASE = 22200
 HTTP_PORT_BASE = 28200
