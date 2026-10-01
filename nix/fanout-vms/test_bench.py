@@ -2618,13 +2618,19 @@ def flake_root() -> Path | None:
 
     A flake.nix further up the filesystem does not count: /tmp holds copies of
     this project, and one of those would answer for a source tree that is not
-    the one under test. The flake has to own the directory these tests are in.
+    the one under test. The flake has to own the directory these tests are in,
+    and it has to be a buildable flake - flake.lock beside flake.nix - because
+    the check sandbox ships flake.nix as a text fixture for the
+    platform-agreement tests. Without the lock that fixture would look like the
+    real source and would be asked to name a runner the sandbox never built.
     """
     here = Path(__file__).resolve().parent
     for parent in here.parents:
-        if (parent / "flake.nix").is_file() and (
-            parent / "nix" / "fanout-vms"
-        ).resolve() == here:
+        if (
+            (parent / "flake.nix").is_file()
+            and (parent / "flake.lock").is_file()
+            and (parent / "nix" / "fanout-vms").resolve() == here
+        ):
             return parent
     return None
 
