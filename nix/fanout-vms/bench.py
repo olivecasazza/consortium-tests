@@ -1657,7 +1657,7 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
                 # Not the CLI's exit status: the tree the run actually built.
                 # A cascade that pushed host-to-each-guest exits 0 and would
                 # otherwise be recorded identically to a real fan-out.
-                "cascade_relay_verified": count,
+                "cascade_relay_verified": cascade_topology["relayed_nodes"],
                 "guest_gateway_relay": "ok",
                 "host_to_seed": "ok",
                 "payload_executions_verified": args.count,
