@@ -111,12 +111,15 @@ harness and driver both live here.
 
 **Two pins in `flake.nix` that are not stylistic:**
 
-- `consortium` is pinned to `850247da` ("accept SSH ports in cascade source
-  addresses"), which is not on master. Relay sources are addressed as
-  `root@10.0.2.2:<port>`, and on master every guest-sourced hop fails, so only
-  seed -> 2 children land. The fleet still passes its per-node checks, which
-  is exactly why this is worth stating: a green run does not prove the relay
-  tree was used.
+- `consortium` is pinned to `d96f964d` on master. That rev carries both halves
+  of the relay check: the guest's `cascade-copy` (with the SSH-port-in-source
+  fix from PR #23, so relay sources addressed as `root@10.0.2.2:<port>` work
+  and every guest-sourced hop lands) and the host's `cast cascade verify`,
+  which the harness's relay check delegates to. One rev for the emitter and
+  the judge is deliberate: the trace format and the round rules it is judged
+  by cannot drift apart. The fleet still passes its per-node checks even when
+  the relay degrades, which is exactly why the stream is verified rather than
+  trusted: a green run does not prove the relay tree was used.
 - `consortium-cli` is built with `doCheck = false`. Its own suite passes in its
   CI, but its `checkPhase` has a BrokenPipe race that fails guest builds
   nondeterministically.
