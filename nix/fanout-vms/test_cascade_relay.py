@@ -14,7 +14,8 @@ both true of the 64-node case for reasons that do not generalize, and the fleet
 sizes here deliberately include partial trees (15, 63, 65), which is where an
 off-by-one in the round count hides. Every expectation is re-derived inside the
 test from the strategy's own arithmetic, so the sweep is an independent oracle
-rather than a restatement of whatever `cascade_tree` happens to compute.
+rather than a restatement of whatever the Rust verifier (`cast cascade verify`,
+which the checker now delegates to) happens to compute.
 """
 
 from __future__ import annotations
@@ -35,14 +36,6 @@ if SPEC is None or SPEC.loader is None:
 bench = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bench
 SPEC.loader.exec_module(bench)
-
-TREE_PATH = Path(__file__).with_name("cascade_tree.py")
-TREE_SPEC = importlib.util.spec_from_file_location("cascade_tree_under_test", TREE_PATH)
-if TREE_SPEC is None or TREE_SPEC.loader is None:
-    raise RuntimeError(f"cannot load {TREE_PATH}")
-tree = importlib.util.module_from_spec(TREE_SPEC)
-sys.modules[TREE_SPEC.name] = tree
-TREE_SPEC.loader.exec_module(tree)
 
 # Fleet sizes for the sweep. 8 and 16 are exact powers of two; 15, 63 and 65
 # are not, so they leave a partial final round — the level that a
@@ -107,10 +100,19 @@ def _relay_depth(n_nodes: int, fanout: int) -> int:
 
 
 def relayed_stream(n_nodes: int, fanout: int = 2) -> str:
-    """A well-formed log-N cascade stream over n_nodes, as cascade-copy emits."""
+    """A well-formed level-tree cascade stream over n_nodes, as the fanout
+    strategy emits.
+
+    The shape below — every node's parent is `(tgt - 1) // fanout`, one full
+    F-ary level per round — is `level-tree`'s, and the round count the tests
+    re-derive is `level-tree`'s own rule, so the label says `level-tree`. A
+    trace labeled `log2-fanout` is judged by log2's round rule, which diverges
+    from this shape wherever the fleet is not a power of two; mislabeling one
+    of these streams is a rejection, and that is pinned separately.
+    """
     events: list[dict] = [
         {"kind": "started", "n_nodes": n_nodes, "seeded": [0],
-         "strategy": "log2-fanout", "at": 0}
+         "strategy": "level-tree", "at": 0}
     ]
     parent: dict[int, int] = {}
     depth_of = {0: 0}
@@ -170,7 +172,7 @@ def multi_seed_relayed_stream(n_nodes: int, fanout: int, seeds: int) -> str:
         raise ValueError(f"cannot seed {seeds} of {n_nodes} nodes")
     events: list[dict] = [
         {"kind": "started", "n_nodes": n_nodes, "seeded": list(range(seeds)),
-         "strategy": "log2-fanout", "at": 0}
+         "strategy": "level-tree", "at": 0}
     ]
     root = seeds - 1
     frontier = [root]
@@ -254,6 +256,50 @@ class CascadeRelayVerificationTest(unittest.TestCase):
         # capture must fail loudly, not quietly verify nothing.
         with self.assertRaises(bench.HarnessError):
             bench.verify_cascade_relay("", count=64, fanout=2)
+
+    def test_a_stream_claiming_the_wrong_strategy_is_rejected(self) -> None:
+        """A level-tree trace labeled `log2-fanout` must not pass as one.
+
+        The verifier judges the trace by the strategy its own `started` event
+        names. Over 63 pending nodes the two round rules disagree — level-tree
+        fills whole F-ary levels (5 rounds), log2 doubles the informed set
+        (6) — so relabeling the stream is the one way a shape could sneak past
+        the rule it does not satisfy. This is not hypothetical bookkeeping:
+        the harness's fleet runs `log2-fanout`, so a checker that accepted any
+        well-formed tree under any label would never notice the fleet's
+        strategy had silently changed.
+        """
+        events = [
+            json.loads(line) for line in relayed_stream(63, 2).splitlines()
+        ]
+        for event in events:
+            if event["kind"] == "started":
+                event["strategy"] = "log2-fanout"
+        mislabeled = "".join(json.dumps(e) + "\n" for e in events)
+        with self.assertRaisesRegex(bench.HarnessError, "round"):
+            bench.verify_cascade_relay(mislabeled, count=63, fanout=2)
+
+    def test_the_fleets_own_label_holds_at_its_fleet_size(self) -> None:
+        """The control for the mislabeling rejection: at 64 nodes the rules agree.
+
+        The fleet runs `log2-fanout` over 64 nodes with one seed, and there the
+        level-tree capacity rule and log2's doubling rule both say 6 rounds —
+        which is why a 64-node run verifies cleanly under its own label. If
+        either rule drifts, this equality breaks and the fleet's own streams
+        stop verifying, so it is pinned here at the exact shape the fleet
+        launches rather than assumed from the sweep.
+        """
+        events = [
+            json.loads(line) for line in relayed_stream(64, 2).splitlines()
+        ]
+        for event in events:
+            if event["kind"] == "started":
+                event["strategy"] = "log2-fanout"
+        fleet_shaped = "".join(json.dumps(e) + "\n" for e in events)
+        summary = bench.verify_cascade_relay(fleet_shaped, count=64, fanout=2)
+        self.assertEqual(64, summary["nodes"])
+        self.assertEqual(6, summary["rounds"])
+        self.assertEqual(63, summary["relayed_nodes"])
 
     def test_a_relayed_cascade_reports_the_shape_the_tree_implies(self) -> None:
         """Sweep the accepted path over every fleet shape.

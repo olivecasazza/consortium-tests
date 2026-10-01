@@ -25,13 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Sequence
 
-# cascade_tree is a sibling module. bench.py runs as a script from this
-# directory, but the unit tests import it from elsewhere, so put the directory
-# on the path explicitly rather than relying on sys.path[0].
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import cascade_tree  # noqa: E402  (sibling module, resolved above)
-
 SSH_PORT_BASE = 22200
 HTTP_PORT_BASE = 28200
 MAX_VM_COUNT = 64
@@ -994,28 +987,77 @@ def cascade_command(store_path: Path, inventory: str, *, fanout: int) -> str:
     )
 
 
-def verify_cascade_relay(stream: str, *, count: int, fanout: int) -> dict[str, int]:
+def verify_cascade_relay(
+    stream: str, *, count: int, fanout: int, verifier: str = "cast"
+) -> dict[str, int]:
     """Assert the cascade really relayed, and describe the tree it built.
 
-    The CLI's exit status cannot tell a peer-to-peer cascade from a host that
-    pushed to every guest in turn: both exit 0. Only the tree can, so this
-    reads the run's own event stream and fails when no peer ever served
-    another.
+    `cast cascade verify` owns the stream grammar, the relay assertion, and
+    the round rule; this hands it the run's whole event stream and translates
+    its verdict. The CLI's exit status cannot tell a peer-to-peer cascade from
+    a host that pushed to every guest in turn — both exit 0 — so the verdict
+    comes from the verifier, and every way the verification can fail (binary
+    absent, non-zero exit, nonsense output) fails the run with the cause
+    named rather than reading as "relay fine".
     """
-    try:
-        topology = cascade_tree.parse_cascade_events(stream)
-        cascade_tree.assert_relay_was_used(topology, fanout=fanout)
-    except cascade_tree.CascadeTreeError as error:
-        raise HarnessError(f"cascade relay check failed: {error}") from error
-    if topology.n_nodes != count:
-        raise HarnessError(
-            f"cascade covered {topology.n_nodes} nodes, expected {count}"
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".jsonl", prefix="cascade-trace-"
+    ) as trace:
+        trace.write(stream)
+        trace.flush()
+        try:
+            completed = subprocess.run(
+                [
+                    verifier,
+                    "cascade",
+                    "verify",
+                    trace.name,
+                    "--fanout",
+                    str(fanout),
+                    "--nodes",
+                    str(count),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=VERIFY_TIMEOUT_S,
+            )
+        except FileNotFoundError as error:
+            raise HarnessError(
+                f"cascade verifier {verifier!r} is not on PATH, so the relay "
+                "check cannot run"
+            ) from error
+        except subprocess.TimeoutExpired as error:
+            raise HarnessError(
+                f"cascade verifier {verifier!r} did not finish within "
+                f"{VERIFY_TIMEOUT_S:.0f}s"
+            ) from error
+    if completed.returncode != 0:
+        diagnostic = (
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or "no diagnostic printed"
         )
+        raise HarnessError(
+            f"cascade verifier failed (exit {completed.returncode}): {diagnostic}"
+        )
+    try:
+        summary = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise HarnessError(
+            "cascade verifier exited 0 but printed unparseable output "
+            f"({error.msg}): {completed.stdout.strip()[:200]!r}"
+        ) from error
+    for field in ("nodes", "rounds", "relay_depth", "relayed_nodes"):
+        value = summary.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise HarnessError(
+                f"cascade verifier reported {field} as {value!r}, not an integer"
+            )
     return {
-        "nodes": topology.n_nodes,
-        "rounds": topology.rounds,
-        "relay_depth": topology.depth,
-        "relayed_nodes": len(topology.parent),
+        "nodes": summary["nodes"],
+        "rounds": summary["rounds"],
+        "relay_depth": summary["relay_depth"],
+        "relayed_nodes": summary["relayed_nodes"],
     }
 
 
