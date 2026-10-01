@@ -1,0 +1,161 @@
+name: Review Gate
+
+# Makes PRs in this repo actually review-gated.
+#
+# PR #17 (~3,500 lines, 7 commits) merged with zero reviews and zero review
+# comments: the reusable ai-item-review workflow existed, but nothing called
+# it for pull requests (upstream-watch.yml was its only consumer). This
+# workflow closes that loop:
+#
+#   items  — derive items.json from the PR's changed files and patches
+#            (.github/scripts/pr_review_items.py, unit tested via the
+#            checks.ci-scripts-test flake check)
+#   review — the reusable ai-item-review workflow asks a Z.AI GLM model for
+#            a strict-JSON review plan. continue-on-error: a model or
+#            secret failure alone must never redden the PR — the gate job
+#            below owns blocking-ness.
+#   gate   — validate the returned plan's shape fail-loud
+#            (.github/scripts/review_plan_check.py, also unit tested) and
+#            render the findings into the run summary.
+#
+# Blocking vs advisory: the gate fails the run only when ZAI_API_KEY is
+# configured on the repository. Until then it is advisory — it runs,
+# validates, and reports as a warning, but cannot block a merge. Adding
+# the secret flips it to blocking with no wiring change.
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to review"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  items:
+    name: Derive review items
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build items.json from the PR diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          python3 .github/scripts/pr_review_items.py \
+            --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" --out items.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-items
+          path: items.json
+          if-no-files-found: error
+
+  review:
+    name: AI review (model call)
+    needs: items
+    continue-on-error: true
+    uses: ./.github/workflows/ai-item-review.yml
+    with:
+      items_artifact: pr-review-items
+      plan_artifact: pr-review-plan
+      model: glm-5.2
+      instructions: |
+        You are the PR review gate for olivecasazza/consortium-tests — a repo
+        that vendors ClusterShell for a Rust-behavior-parity port and hosts a
+        Nix flake launching a 64-node microVM fleet (nix/fanout-vms/).
+
+        ITEMS is a JSON object: "pr" describes the pull request; "items" has
+        one entry per changed file with path, status, additions, deletions
+        and (when available) the patch text; "patch_missing_paths" and
+        "patch_truncated_paths" list files whose diff text is unavailable.
+
+        Review the DIFF. Priorities, in order:
+        1. Correctness bugs (logic, races, resource leaks, wrong paths or
+           units) and security issues (secret handling, injection).
+        2. Missing test coverage for new behavior.
+        3. CI wiring mistakes (artifact-name mismatches, wrong permissions,
+           jobs that cannot run).
+        Do not restyle vendored ClusterShell code under lib/; parity with
+        upstream matters more than local taste.
+
+        Respond with STRICT JSON only (no prose, no markdown fences), exactly
+        this shape, no additional keys:
+        {
+          "verdict": "approve" or "request_changes",
+          "summary": "1-500 chars, one paragraph",
+          "findings": [
+            {"severity": "blocker" or "major" or "minor" or "nit",
+             "path": "a path copied exactly from ITEMS items[].path, or empty string",
+             "note": "1-500 chars, specific and actionable"}
+          ]
+        }
+        Rules: "blocker" only for correctness/security problems that must not
+        merge; use verdict "request_changes" if any finding is a blocker.
+        findings may be empty.
+    secrets:
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+
+  gate:
+    name: Review plan gate
+    needs: [items, review]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download review plan
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-review-plan
+          path: plan
+        # The review job legitimately produces no artifact when the model
+        # call fails (e.g. secret unset); the validate step below decides
+        # whether that blocks.
+        continue-on-error: true
+
+      - name: Download review items
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-review-items
+          path: items
+
+      - name: Validate plan shape (fail loud when the gate is armed)
+        env:
+          # Presence test only — the key value never reaches the log.
+          GATE_ARMED: ${{ secrets.ZAI_API_KEY != '' }}
+        run: |
+          if python3 .github/scripts/review_plan_check.py \
+              --plan plan/plan.json --items items/items.json; then
+            exit 0
+          elif [ "$GATE_ARMED" = "true" ]; then
+            echo "::error::review plan missing or malformed while ZAI_API_KEY is configured — blocking"
+            exit 1
+          else
+            echo "::warning::review plan missing or malformed, but ZAI_API_KEY is NOT configured on this repository — gate is ADVISORY (non-blocking) until the secret is added"
+          fi
+
+      - name: Summarize findings
+        if: ${{ hashFiles('plan/plan.json') != '' }}
+        run: |
+          {
+            echo "### Review gate verdict: \`$(jq -r .verdict plan/plan.json)\`"
+            echo
+            jq -r .summary plan/plan.json
+            echo
+            jq -r '.findings[] | "- **\(.severity)** `\(.path)` — \(.note)"' plan/plan.json
+          } >> "$GITHUB_STEP_SUMMARY"

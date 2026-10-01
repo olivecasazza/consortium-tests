@@ -35,3 +35,6 @@ jobs:
 
       - name: Run the launcher safety tests
         run: nix build .#checks.x86_64-linux.fanout-bench-test
+
+      - name: Run the CI scripts tests
+        run: nix build .#checks.x86_64-linux.ci-scripts-test
