@@ -436,6 +436,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cascade-strategy",
+        default="log2-fanout",
+        help=(
+            "cascade strategy the guest's cascade-copy runs: log2-fanout relays "
+            "peer to peer, while swarm has every node pull straight from the "
+            "seed. log2-fanout is what a real fleet run means; swarm exists so "
+            "the relay check can be exercised against a run that genuinely "
+            "never relayed. Membership is not checked here on purpose: the "
+            "canonical names and their aliases are owned by consortium's "
+            "registry, and duplicating that list in this harness is how the "
+            "two drift apart. An unknown name is rejected by cascade-copy "
+            "itself, with the list it accepts. Run 'cast cascade strategies' "
+            "for that list. (default: log2-fanout)"
+        ),
+    )
+    parser.add_argument(
+        "--cascade-fanout",
+        type=int,
+        default=2,
+        help=(
+            "fanout width for strategies that take one; log2-fanout ignores "
+            "it, level-tree and max-bottleneck use it. (default: 2)"
+        ),
+    )
+    parser.add_argument(
         "--ready-probe-binary",
         required=True,
         help=(
@@ -501,6 +526,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.startup_deadline <= 0:
         parser.error("--startup-deadline must be greater than zero")
+    if not args.cascade_strategy.strip():
+        parser.error("--cascade-strategy must name a strategy; see `cast cascade strategies`")
+    if any(character.isspace() for character in args.cascade_strategy):
+        parser.error(
+            "--cascade-strategy must be a single name with no whitespace, as it "
+            "is passed through to cascade-copy"
+        )
+    if args.cascade_fanout < 1:
+        parser.error("--cascade-fanout must be at least 1")
     binary_relative_path = PurePosixPath(args.binary_relative_path)
     if (
         binary_relative_path.is_absolute()
@@ -1246,7 +1280,9 @@ def write_inventory(path: Path, count: int) -> str:
     return content
 
 
-def cascade_command(store_path: Path, inventory: str, *, fanout: int) -> str:
+def cascade_command(
+    store_path: Path, inventory: str, *, fanout: int, strategy: str
+) -> str:
     """The guest-side command that distributes one closure across the fleet.
 
     `--format jsonl` is what makes this checkable at all: cascade-copy runs
@@ -1260,7 +1296,7 @@ def cascade_command(store_path: Path, inventory: str, *, fanout: int) -> str:
             "--inventory",
             inventory,
             "--strategy",
-            "log2-fanout",
+            strategy,
             "--fanout",
             str(fanout),
             "--no-watch",
@@ -1361,6 +1397,7 @@ def run_cascade(
     *,
     count: int,
     fanout: int,
+    strategy: str,
     evidence_dir: Path | None = None,
 ) -> dict[str, int]:
     """Distribute one closure across the fleet and prove the relay was used.
@@ -1392,7 +1429,9 @@ def run_cascade(
         host_ssh_command(
             ssh_key,
             SSH_PORT_BASE + 1,
-            cascade_command(store_path, INVENTORY_GUEST_PATH, fanout=fanout),
+            cascade_command(
+                  store_path, INVENTORY_GUEST_PATH, fanout=fanout, strategy=strategy
+              ),
         ),
         timeout=CASCADE_TIMEOUT_S,
         on_failure=record,
@@ -1950,6 +1989,8 @@ def deploy_and_verify(
     inventory_content: str,
     binary_relative_path: PurePosixPath,
     expected_stdout: str,
+    fanout: int,
+    strategy: str,
 ) -> tuple[float, dict[str, int]]:
     deployment_started = time.monotonic()
     encoded_key = urllib.parse.quote(str(ssh_key), safe="/")
@@ -1975,7 +2016,8 @@ def deploy_and_verify(
         store_path,
         inventory_content,
         count=len(vms),
-        fanout=2,
+          fanout=fanout,
+          strategy=strategy,
         evidence_dir=evidence_dir,
     )
 
@@ -2223,7 +2265,10 @@ def remove_vm_scratch(scratch: Path | None) -> list[str]:
 
 
 def failed_result(
-    vms: Sequence[VmProcess], failure: BaseException, cleanup_errors: Sequence[str]
+    vms: Sequence[VmProcess],
+    failure: BaseException,
+    cleanup_errors: Sequence[str],
+    strategy: str | None = None,
 ) -> dict[str, Any]:
     """The run's result, as far as it got, published with the failure.
 
@@ -2243,6 +2288,10 @@ def failed_result(
         message = f"{message}; cleanup also failed: {'; '.join(cleanup_errors)}"
     return {
         "error": message,
+        # Which strategy this run asked for. A passing run records it, so a
+        # failing one must too: a rejection that does not say what it rejected
+        # leaves the reader guessing whether the relay or something else broke.
+        "cascade_strategy": strategy,
         "node_identities": node_identity_report(vms),
         "readiness": readiness_report(vms),
         "status": "failed",
@@ -2329,6 +2378,8 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             inventory_content,
             args.binary_relative_path,
             args.expect_stdout,
+            args.cascade_fanout,
+            args.cascade_strategy,
         )
         result = {
             "boot": args.boot,
@@ -2358,6 +2409,9 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
             # SSH/HTTP polling. launch used to be added into bring_up_max,
             # which double-counted the whole spawn phase against QMP bring-up.
             "cascade_topology": cascade_topology,
+            # Which strategy produced the topology above, so a result says what
+            # it measured rather than leaving the reader to assume log2.
+            "cascade_strategy": args.cascade_strategy,
             "readiness_phases_s": {
                 "launch": round(launch_s, 6),
                 "bring_up_max": round(bring_up_max_s, 6),
@@ -2402,7 +2456,9 @@ def execute_benchmark(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]
     cleanup_errors.extend(remove_vm_scratch(scratch))
 
     if failure is not None:
-        report = failed_result(vms, failure, cleanup_errors)
+        report = failed_result(
+            vms, failure, cleanup_errors, strategy=args.cascade_strategy
+        )
         # An interrupt the cleanup could honour is still an interrupt, and
         # main's exit code for it says so; anything else, including an
         # interrupt that left VMs behind, is a failure carrying its report.

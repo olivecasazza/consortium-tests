@@ -19,6 +19,7 @@ import re
 import shutil
 import signal
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -3058,3 +3059,59 @@ class RealRunnerNicLookupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CascadeStrategySelectionTest(unittest.TestCase):
+    """Which strategy the fleet's relay runs is a choice, not a constant.
+
+    A run that reports "the relay was verified" must say which relay, or the
+    reader has to assume log2. Making it selectable is also what lets swarm -
+    every node pulling straight from the seed, no peer ever serving another -
+    be driven through a real fleet, which is the only way to show the relay
+    check can reject something.
+    """
+
+    def test_the_default_is_log2_fanout(self) -> None:
+        command = shlex.split(
+            bench.cascade_command(
+                Path("/nix/store/abc"), "/tmp/inv", fanout=2, strategy="log2-fanout"
+            )
+        )
+        self.assertIn("--strategy", command)
+        self.assertEqual("log2-fanout", command[command.index("--strategy") + 1])
+
+    def test_a_chosen_strategy_reaches_the_guest_command(self) -> None:
+        for strategy in ("swarm", "level-tree", "steiner-greedy"):
+            with self.subTest(strategy=strategy):
+                command = shlex.split(
+                    bench.cascade_command(
+                        Path("/nix/store/abc"),
+                        "/tmp/inv",
+                        fanout=2,
+                        strategy=strategy,
+                    )
+                )
+                self.assertEqual(strategy, command[command.index("--strategy") + 1])
+
+    def test_parse_defaults_to_log2_fanout_and_fanout_two(self) -> None:
+        args = parse_harness_args()
+        self.assertEqual("log2-fanout", args.cascade_strategy)
+        self.assertEqual(2, args.cascade_fanout)
+
+    def test_parse_accepts_a_chosen_strategy(self) -> None:
+        args = parse_harness_args(extra=("--cascade-strategy", "swarm"))
+        self.assertEqual("swarm", args.cascade_strategy)
+        args = parse_harness_args(extra=("--cascade-fanout", "3"))
+        self.assertEqual(3, args.cascade_fanout)
+
+    def test_parse_rejects_a_malformed_strategy_before_any_vm_launches(self) -> None:
+        # A typo that reached the guest would launch a whole fleet before
+        # cascade-copy rejected it, so shape is checked at parse time. Membership
+        # is deliberately NOT checked here: consortium owns that registry, and
+        # copying its list into this harness is how the two would drift.
+        for bad in (("--cascade-strategy", "two words"), ("--cascade-strategy", "  ")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit):
+                    parse_harness_args(extra=bad)
+        with self.assertRaises(SystemExit):
+            parse_harness_args(extra=("--cascade-fanout", "0"))

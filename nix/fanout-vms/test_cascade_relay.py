@@ -203,7 +203,9 @@ class CascadeCommandTest(unittest.TestCase):
         # run emits nothing at all, which is why the harness could only ever
         # record an exit status.
         command = shlex.split(
-            bench.cascade_command(Path("/nix/store/abc"), "/tmp/inv", fanout=2)
+            bench.cascade_command(
+                  Path("/nix/store/abc"), "/tmp/inv", fanout=2, strategy="log2-fanout"
+              )
         )
         self.assertIn("--format", command)
         self.assertEqual("jsonl", command[command.index("--format") + 1])
@@ -217,7 +219,10 @@ class CascadeCommandTest(unittest.TestCase):
             with self.subTest(fanout=fanout):
                 command = shlex.split(
                     bench.cascade_command(
-                        Path("/nix/store/abc"), "/tmp/inv", fanout=fanout
+                        Path("/nix/store/abc"),
+                        "/tmp/inv",
+                        fanout=fanout,
+                        strategy="log2-fanout",
                     )
                 )
                 self.assertIn("--format", command)
@@ -661,6 +666,7 @@ class CascadeStepTest(unittest.TestCase):
                 store_path=Path("/nix/store/abc"),
                 inventory_content="seed = 'root@127.0.0.1'\n",
                 count=count,
+                strategy="log2-fanout",
                 fanout=fanout,
             )
 
@@ -807,6 +813,7 @@ class CascadeEvidenceTest(unittest.TestCase):
                         store_path=Path("/nix/store/abc"),
                         inventory_content="seed = 'root@127.0.0.1'\n",
                         count=8,
+                        strategy="log2-fanout",
                         fanout=2,
                         evidence_dir=evidence,
                     )
@@ -826,6 +833,7 @@ class CascadeEvidenceTest(unittest.TestCase):
                         store_path=Path("/nix/store/abc"),
                         inventory_content="seed = 'root@127.0.0.1'\n",
                         count=64,
+                        strategy="log2-fanout",
                         fanout=2,
                         evidence_dir=evidence,
                     )
