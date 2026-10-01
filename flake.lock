@@ -12,17 +12,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1790743413,
-        "narHash": "sha256-zaaeep3P6ljUcU12wDGRoNtni8UTWPvdCAaUa8a8l58=",
-        "ref": "feat/cascade-copy-jsonl",
-        "rev": "98b99542536accb73b5234cca1f631d73eebd554",
-        "revCount": 1067,
+        "lastModified": 1790810984,
+        "narHash": "sha256-ef38Mzyi7PTmrxhpQtz/h/YcuMgEZqypwSZHHmCd2aI=",
+        "ref": "fix/cascade-ssh-port",
+        "rev": "0c1be26c0db53081e95ed3ae315b1c35ea72fd52",
+        "revCount": 1068,
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       },
       "original": {
-        "ref": "feat/cascade-copy-jsonl",
-        "rev": "98b99542536accb73b5234cca1f631d73eebd554",
+        "ref": "fix/cascade-ssh-port",
+        "rev": "0c1be26c0db53081e95ed3ae315b1c35ea72fd52",
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       }
