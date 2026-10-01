@@ -58,12 +58,20 @@ let
   # per-VM ROM blobs (~90 MB each) that only a guest reset uses.
   runner = vmHostPackages.runCommand "fanout64-microvm-run" { meta.mainProgram = "microvm-run"; } ''
     mkdir -p $out/bin
+    # The per-launch MAC is expanded by the runner at exec time, so the device
+    # token has to be double-quoted or the variable reaches QEMU as literal
+    # text. Only the aarch64-darwin shape was being re-quoted: x86_64 emits
+    # `virtio-net-device,netdev=net0,mac=<addr>` and ends the argument there,
+    # so it kept its single quotes and QEMU rejected the address. Re-quote that
+    # shape too. The mac substitution anchors on the key rather than on a
+    # trailing comma, since only aarch64-darwin continues with `,romfile=`.
     sed -e 's/''${runtime_args:-}[[:space:]]*$/''${runtime_args:-} "$@"/' \
         -e "s|'virtio-net-pci,\(.*\),romfile='|\"virtio-net-pci,\\1,romfile=\"|" \
-        -e 's|,mac=\([0-9a-fA-F:]*\),|,mac=''${FANOUT_NIC_MAC:-\1},|' \
+        -e "s|'virtio-net-device,\(.*\)'|\"virtio-net-device,\\1\"|" \
+        -e 's|,mac=\([0-9a-fA-F:]*\)|,mac=''${FANOUT_NIC_MAC:-\1}|g' \
         ${lib.getExe' configuration.config.microvm.runner.qemu "microvm-run"} > $out/bin/microvm-run
     grep -q 'runtime_args:-} "\$@"$' $out/bin/microvm-run
-    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01},' $out/bin/microvm-run
+    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01}' $out/bin/microvm-run
     sed -E "s/ -kernel [^ ]+//; s/ -initrd [^ ]+//; s/ -append '[^']*'//" \
       $out/bin/microvm-run > $out/bin/microvm-restore
     if grep -qE -- ' -(kernel|initrd|append) ' $out/bin/microvm-restore; then
@@ -71,7 +79,7 @@ let
       exit 1
     fi
     grep -q 'runtime_args:-} "\$@"$' $out/bin/microvm-restore
-    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01},' $out/bin/microvm-restore
+    grep -q 'mac=''${FANOUT_NIC_MAC:-02:00:00:00:00:01}' $out/bin/microvm-restore
     chmod +x $out/bin/microvm-run $out/bin/microvm-restore
   '';
 in

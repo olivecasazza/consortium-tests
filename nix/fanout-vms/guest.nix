@@ -129,18 +129,18 @@ in
   # The address is per launch (see microvm.interfaces), so it cannot be a
   # stable match: a .network keyed on a MAC would stop matching the moment
   # bench.py hands this VM its own, and the guest would lose DHCP. The name is
-  # pinned here instead of left to the kernel, which derives it from PCI slot
-  # order, so the name is the same in the captured guest and in all 64
-  # restores. The match is on device type and on ID_BUS, a udev property the
-  # kernel emits when the device is registered, because this is a stage-1
-  # rename: the driver need not be bound yet, and the address, the one
-  # property that is certain, differs per launch. Property= is the [Match] key
-  # that reads a udev property; there is no Bus= key to use instead. There is
-  # exactly one NIC.
+  # pinned here instead of left to the kernel, which derives it from bus slot
+  # order, so the name is the same in the captured guest and in all restores.
+  # The guest must know its own NIC by a name identical across VMs, and the MAC
+  # can no longer be used to match on because each launch has its own. Match on
+  # the link type only: aarch64-darwin attaches virtio-net-pci but x86_64
+  # attaches virtio-net-device on the MMIO bus, so a bus constraint matched one
+  # platform and silently skipped the other — no rename, so the network below
+  # never matched and the guest never got an address. This guest has exactly one
+  # NIC, so matching every ethernet link is unambiguous.
   systemd.network.links."10-fanout" = {
     matchConfig = {
       Type = "ether";
-      Property = "ID_BUS=pci";
     };
     linkConfig.Name = "net0";
   };
