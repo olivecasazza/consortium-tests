@@ -180,6 +180,21 @@
                 python -m unittest discover -s nix/fanout-vms -p 'test_*.py' -v
                 touch $out
               '';
+          # CI helper scripts (.github/scripts): the PR review gate's pure
+          # logic — items derivation and plan shape validation — is unit
+          # tested here so a review-gate regression cannot land unnoticed.
+          checks.ci-scripts-test =
+            pkgs.runCommand "consortium-ci-scripts-test"
+              {
+                nativeBuildInputs = [ python ];
+              }
+              ''
+                export PYTHONDONTWRITEBYTECODE=1
+                cp -r ${./.github/scripts} ci-scripts
+                chmod -R u+w ci-scripts
+                python -m unittest discover -s ci-scripts/tests -p 'test_*.py' -v
+                touch $out
+              '';
           devShells.default = pkgs.mkShell {
             # The parity suite is pytest against the vendored oracle in `lib/`,
             # and the integration layer is cargo against the sibling consortium
