@@ -51,6 +51,7 @@
       inherit (nixpkgs) lib;
       supportedSystems = [
         "aarch64-darwin"
+        "aarch64-linux"
         "x86_64-linux"
       ];
 
@@ -167,9 +168,16 @@
               }
               ''
                 export PYTHONDONTWRITEBYTECODE=1
-                cp -r ${./nix/fanout-vms} fanout-vms
-                chmod -R u+w fanout-vms
-                python -m unittest discover -s fanout-vms -p 'test_*.py' -v
+                # Keep the nix/fanout-vms nesting and ship the root flake. The
+                # platform-agreement tests read supportedSystems from
+                # Path(__file__).parents[2]/flake.nix; flattening the copy put
+                # that path outside the sandbox, so the check failed on a file
+                # it had never been given.
+                mkdir -p nix
+                cp -r ${./nix/fanout-vms} nix/fanout-vms
+                cp ${./flake.nix} flake.nix
+                chmod -R u+w nix flake.nix
+                python -m unittest discover -s nix/fanout-vms -p 'test_*.py' -v
                 touch $out
               '';
           devShells.default = pkgs.mkShell {

@@ -8,7 +8,6 @@
 }:
 
 let
-  guestMac = "02:00:00:00:00:01";
   busyboxHttpd = pkgs.busybox.override {
     extraConfig = ''
       CONFIG_HTTPD y
@@ -56,7 +55,16 @@ in
       {
         type = "user";
         id = "net0";
-        mac = guestMac;
+        # microvm.nix declares this option with no default and destructures it
+        # when it builds the -device line, so an interface without one fails
+        # evaluation. The value is the capture-time address, which is VM 1's:
+        # the capture guest boots from this image. It is also the runner's
+        # fallback, because each launch substitutes its own address into this
+        # very mac= as QEMU builds the machine (see default.nix). An explicit
+        # mac= here outranks a -global virtio-net-pci.mac= passed at launch,
+        # and a -device is realized before the monitor is reachable, so the
+        # address cannot be written onto the device afterwards over QMP.
+        mac = "02:00:00:00:00:01";
       }
     ];
     forwardPorts = [ ];
@@ -118,8 +126,27 @@ in
     ];
   };
 
+  # The address is per launch (see microvm.interfaces), so it cannot be a
+  # stable match: a .network keyed on a MAC would stop matching the moment
+  # bench.py hands this VM its own, and the guest would lose DHCP. The name is
+  # pinned here instead of left to the kernel, which derives it from bus slot
+  # order, so the name is the same in the captured guest and in all restores.
+  # The guest must know its own NIC by a name identical across VMs, and the MAC
+  # can no longer be used to match on because each launch has its own. Match on
+  # the link type only: aarch64-darwin attaches virtio-net-pci but x86_64
+  # attaches virtio-net-device on the MMIO bus, so a bus constraint matched one
+  # platform and silently skipped the other — no rename, so the network below
+  # never matched and the guest never got an address. This guest has exactly one
+  # NIC, so matching every ethernet link is unambiguous.
+  systemd.network.links."10-fanout" = {
+    matchConfig = {
+      Type = "ether";
+    };
+    linkConfig.Name = "net0";
+  };
+
   systemd.network.networks."10-user" = {
-    matchConfig.MACAddress = guestMac;
+    matchConfig.Name = "net0";
     networkConfig = {
       DHCP = "ipv4";
       IPv6AcceptRA = false;

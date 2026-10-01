@@ -2,6 +2,7 @@
   "nodes": {
     "consortium": {
       "inputs": {
+        "context-engineering-kit": "context-engineering-kit",
         "crane": "crane",
         "flake-parts": "flake-parts",
         "git-hooks-nix": "git-hooks-nix",
@@ -12,22 +13,39 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1790450292,
-        "narHash": "sha256-ScutcZ8kjARagRZnQJa+6vdc2XYDzm0eSWNdg6gfTyw=",
-        "ref": "feat/fanout-vm-harness",
-        "rev": "850247da6ac4a09aa377fe96993126334304db34",
-        "revCount": 1049,
+        "lastModified": 1790748773,
+        "narHash": "sha256-Qp2hDC0QVmW0oqeL5cQ76Qu0Jhev5ATdO3iuAI/N8C8=",
+        "ref": "master",
+        "rev": "799541f9c47117b9b9c513633d1f5c925abe6650",
+        "revCount": 1070,
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       },
       "original": {
-        "ref": "feat/fanout-vm-harness",
-        "rev": "850247da6ac4a09aa377fe96993126334304db34",
+        "ref": "master",
+        "rev": "799541f9c47117b9b9c513633d1f5c925abe6650",
         "type": "git",
         "url": "https://github.com/olivecasazza/consortium"
       }
     },
     "context-engineering-kit": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787778481,
+        "narHash": "sha256-HiF7c6a6EPsIbGka/ZFqggx9OfJm90N1w3Fh7IRv81s=",
+        "ref": "refs/heads/master",
+        "rev": "23e2428e809d77717f8acc9659c374a3a1fcb93e",
+        "revCount": 410,
+        "type": "git",
+        "url": "https://github.com/NeoLabHQ/context-engineering-kit"
+      },
+      "original": {
+        "rev": "23e2428e809d77717f8acc9659c374a3a1fcb93e",
+        "type": "git",
+        "url": "https://github.com/NeoLabHQ/context-engineering-kit"
+      }
+    },
+    "context-engineering-kit_2": {
       "flake": false,
       "locked": {
         "lastModified": 1787778481,
@@ -228,7 +246,7 @@
     "root": {
       "inputs": {
         "consortium": "consortium",
-        "context-engineering-kit": "context-engineering-kit",
+        "context-engineering-kit": "context-engineering-kit_2",
         "microvm-nix": "microvm-nix_2",
         "nixpkgs": "nixpkgs_2"
       }
