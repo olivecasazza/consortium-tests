@@ -16,7 +16,7 @@ forwards applied over QMP at launch.
 | Guest | 1 vCPU, 512 MiB, immutable erofs store + writable ext4 overlay |
 | Host systems | `x86_64-linux` (KVM) and `aarch64-darwin` (HVF), both built and measured |
 | Readiness | SSH *and* HTTP `/health` answering on every node |
-| Payload | a store path copied host -> seed, then relayed log2-fanout to the rest |
+| Payload | a store path copied host -> seed, then relayed to the rest; `--cascade-strategy` chooses the relay topology, default `log2-fanout` |
 
 **What "ready" means.** Both checks, on every node, and a node that fails
 either is not counted:
