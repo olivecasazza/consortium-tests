@@ -2163,13 +2163,31 @@ class ReadinessNegativeControlTest(unittest.TestCase):
             yield
 
     def control(self, *, count: int, control_vm: int) -> dict[str, Any]:
-        """One control run, as a record, over a fleet the host stands in for."""
+        """One control run, as a record, over a fleet the host stands in for.
+
+        A healthy node that never got polled is the machine being too busy,
+        not the harness misbehaving, and every test here fails differently
+        when that happens. So the distinction is made once, here, where all of
+        them can be told apart: a node that should be ready and is not is an
+        environment problem wearing the costume of a relay regression.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = self.control_args(root, count=count, control_vm=control_vm)
             run_dir = Path(tempfile.mkdtemp(prefix="fv-", dir=root))
             with self.fleet(count=count):
-                return bench.run_negative_control(args, run_dir)
+                record = bench.run_negative_control(args, run_dir)
+        health = record.get("observation", {}).get("last_http_results", {})
+        for node in range(1, count + 1):
+            if node != control_vm and health.get(str(node)) != bench.HEALTH_OK:
+                self.fail(
+                    f"healthy node {node} reported "
+                    f"{health.get(str(node))!r}, not {bench.HEALTH_OK!r}. Node "
+                    f"{control_vm} is the only node the control denies, so this "
+                    "is a shared machine starving a readiness poll, not a relay "
+                    "regression; re-run on a quieter host before believing it"
+                )
+        return record
 
     def test_the_run_is_rejected_for_the_node_denied_its_health_endpoint(self) -> None:
         record = self.control(count=3, control_vm=2)
@@ -2205,18 +2223,8 @@ class ReadinessNegativeControlTest(unittest.TestCase):
         # fault belongs to.
         record = self.control(count=3, control_vm=2)
         health = record["observation"]["last_http_results"]
-        # A healthy node that timed out rather than answering is the machine
-        # being too busy, not the harness misbehaving, and the two look
-        # identical if this only reports which value it got. Say which it was.
-        for node in ("1", "3"):
-            if health.get(node) != bench.HEALTH_OK:
-                self.fail(
-                    f"healthy node {node} reported {health.get(node)!r}, not "
-                    f"{bench.HEALTH_OK!r}. The control denies node 2 only, so "
-                    "this is a shared machine starving a poll rather than a "
-                    "relay regression; re-run on a quieter host before "
-                    "believing it"
-                )
+        # A healthy node that never answered is already reported by control(),
+        # which owns that distinction for every test in this class.
         self.assertNotEqual(bench.HEALTH_OK, health["2"])
         self.assertEqual(2, record["statuses"]["nodes_health_ready"])
 
