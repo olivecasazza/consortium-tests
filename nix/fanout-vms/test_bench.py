@@ -19,6 +19,7 @@ import re
 import shutil
 import signal
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -2065,7 +2066,17 @@ class ForwardingQmp(FakeQmp):
 # out, so the deadline is what bounds a control run here: long enough for the
 # nodes that are healthy to be polled and record a reading, short enough that
 # the test does not wait on it.
-NEGATIVE_CONTROL_DEADLINE_S = 0.5
+#
+# This was 0.5s, which is a wall-clock budget for forking threads, opening
+# sockets and polling three nodes: fine when the machine is idle, a false
+# negative when it is not. On a shared runner it produced a real
+# "last HTTP result: timed out" for a node that was healthy, failing the test
+# for a reason unrelated to what it claims. The evidence this test rests on is
+# that the DENIED node's forward was never created, and that does not race, so
+# the budget only has to be large enough that a healthy node is not starved
+# into looking broken. Five seconds is still short against the control's real
+# work, which is refusing one node.
+NEGATIVE_CONTROL_DEADLINE_S = 5.0
 
 
 class ReadinessNegativeControlTest(unittest.TestCase):
@@ -2152,13 +2163,31 @@ class ReadinessNegativeControlTest(unittest.TestCase):
             yield
 
     def control(self, *, count: int, control_vm: int) -> dict[str, Any]:
-        """One control run, as a record, over a fleet the host stands in for."""
+        """One control run, as a record, over a fleet the host stands in for.
+
+        A healthy node that never got polled is the machine being too busy,
+        not the harness misbehaving, and every test here fails differently
+        when that happens. So the distinction is made once, here, where all of
+        them can be told apart: a node that should be ready and is not is an
+        environment problem wearing the costume of a relay regression.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = self.control_args(root, count=count, control_vm=control_vm)
             run_dir = Path(tempfile.mkdtemp(prefix="fv-", dir=root))
             with self.fleet(count=count):
-                return bench.run_negative_control(args, run_dir)
+                record = bench.run_negative_control(args, run_dir)
+        health = record.get("observation", {}).get("last_http_results", {})
+        for node in range(1, count + 1):
+            if node != control_vm and health.get(str(node)) != bench.HEALTH_OK:
+                self.fail(
+                    f"healthy node {node} reported "
+                    f"{health.get(str(node))!r}, not {bench.HEALTH_OK!r}. Node "
+                    f"{control_vm} is the only node the control denies, so this "
+                    "is a shared machine starving a readiness poll, not a relay "
+                    "regression; re-run on a quieter host before believing it"
+                )
+        return record
 
     def test_the_run_is_rejected_for_the_node_denied_its_health_endpoint(self) -> None:
         record = self.control(count=3, control_vm=2)
@@ -2194,8 +2223,8 @@ class ReadinessNegativeControlTest(unittest.TestCase):
         # fault belongs to.
         record = self.control(count=3, control_vm=2)
         health = record["observation"]["last_http_results"]
-        self.assertEqual(bench.HEALTH_OK, health["1"])
-        self.assertEqual(bench.HEALTH_OK, health["3"])
+        # A healthy node that never answered is already reported by control(),
+        # which owns that distinction for every test in this class.
         self.assertNotEqual(bench.HEALTH_OK, health["2"])
         self.assertEqual(2, record["statuses"]["nodes_health_ready"])
 
@@ -3058,3 +3087,59 @@ class RealRunnerNicLookupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CascadeStrategySelectionTest(unittest.TestCase):
+    """Which strategy the fleet's relay runs is a choice, not a constant.
+
+    A run that reports "the relay was verified" must say which relay, or the
+    reader has to assume log2. Making it selectable is also what lets swarm -
+    every node pulling straight from the seed, no peer ever serving another -
+    be driven through a real fleet, which is the only way to show the relay
+    check can reject something.
+    """
+
+    def test_the_default_is_log2_fanout(self) -> None:
+        command = shlex.split(
+            bench.cascade_command(
+                Path("/nix/store/abc"), "/tmp/inv", fanout=2, strategy="log2-fanout"
+            )
+        )
+        self.assertIn("--strategy", command)
+        self.assertEqual("log2-fanout", command[command.index("--strategy") + 1])
+
+    def test_a_chosen_strategy_reaches_the_guest_command(self) -> None:
+        for strategy in ("swarm", "level-tree", "steiner-greedy"):
+            with self.subTest(strategy=strategy):
+                command = shlex.split(
+                    bench.cascade_command(
+                        Path("/nix/store/abc"),
+                        "/tmp/inv",
+                        fanout=2,
+                        strategy=strategy,
+                    )
+                )
+                self.assertEqual(strategy, command[command.index("--strategy") + 1])
+
+    def test_parse_defaults_to_log2_fanout_and_fanout_two(self) -> None:
+        args = parse_harness_args()
+        self.assertEqual("log2-fanout", args.cascade_strategy)
+        self.assertEqual(2, args.cascade_fanout)
+
+    def test_parse_accepts_a_chosen_strategy(self) -> None:
+        args = parse_harness_args(extra=("--cascade-strategy", "swarm"))
+        self.assertEqual("swarm", args.cascade_strategy)
+        args = parse_harness_args(extra=("--cascade-fanout", "3"))
+        self.assertEqual(3, args.cascade_fanout)
+
+    def test_parse_rejects_a_malformed_strategy_before_any_vm_launches(self) -> None:
+        # A typo that reached the guest would launch a whole fleet before
+        # cascade-copy rejected it, so shape is checked at parse time. Membership
+        # is deliberately NOT checked here: consortium owns that registry, and
+        # copying its list into this harness is how the two would drift.
+        for bad in (("--cascade-strategy", "two words"), ("--cascade-strategy", "  ")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit):
+                    parse_harness_args(extra=bad)
+        with self.assertRaises(SystemExit):
+            parse_harness_args(extra=("--cascade-fanout", "0"))
