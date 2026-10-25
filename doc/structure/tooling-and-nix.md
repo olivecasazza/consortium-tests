@@ -36,10 +36,12 @@ The move to `tools/` preserved directory depth, so `sync_upstream_tests.sh`'s
 ## `nix/fanout-vms/` — the fanout64 benchmark
 
 A flake source tree, not a test directory, holding the 64-microVM fanout
-benchmark. It is a **fourth** place tests live: `test_bench.py` is run by a Nix
-check (`flake.nix:112` `checks.fanout-bench-test`, discovered at `flake.nix:123`)
-and by `nix-checks.yml:37`. Those tests are invisible to the repo's own pytest
-config, because `pyproject.toml:2` sets `testpaths = ["tests"]`.
+benchmark. The launcher safety tests are Buildbot-discovered Nix checks:
+`flake.nix:185` `checks.fanout-bench-test` (alongside
+`checks.ci-scripts-test`). The root check projection runs both checks on the
+canonical Buildbot worker; they are intentionally not duplicated in GHA.
+Those tests are invisible to the repo's own pytest config, because
+`pyproject.toml:2` sets `testpaths = ["tests"]`.
 
 ## The flake is not Snowfall Lib
 
@@ -56,7 +58,7 @@ recorded here as a known divergence, not silently assumed.
 ## CI shape
 
 - `parity.yml` — the only workflow running the Python and Rust test layers.
-- `nix-checks.yml` — `nix flake check --no-build` plus the fanout launcher tests.
+- `review-gate.yml` — review-item derivation and the optional AI review gate.
 - `upstream-watch.yml` — the weekly ClusterShell upstream sync.
 - `ai-item-review.yml` — a reusable `workflow_call` gate used by the watcher.
 
