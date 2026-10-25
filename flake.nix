@@ -290,12 +290,10 @@
         systems = supportedSystems;
         packageSystems = supportedSystems;
         checkSystems = [ "x86_64-linux" ];
-        # Publish Linux derivations for Hydra; Darwin remains a local
-        # package system and is not advertised as a PR check or Hydra worker.
-        hydraSystems = [
-          "x86_64-linux"
-          "aarch64-linux"
-        ];
+        # The live Hydra artifact pool is x86_64-linux only. Keep package
+        # outputs multi-arch for public consumers; only Hydra scheduling is
+        # narrowed to workers that actually exist.
+        hydraSystems = [ "x86_64-linux" ];
         buildFor = perSystem;
       };
     in
