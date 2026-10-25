@@ -290,7 +290,10 @@
         systems = supportedSystems;
         packageSystems = supportedSystems;
         checkSystems = supportedSystems;
-        hydraSystems = supportedSystems;
+        hydraSystems = [
+          "x86_64-linux"
+          "aarch64-linux"
+        ];
         buildFor = perSystem;
       };
     in
