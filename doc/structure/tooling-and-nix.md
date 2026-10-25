@@ -60,6 +60,13 @@ recorded here as a known divergence, not silently assumed.
 - `upstream-watch.yml` — the weekly ClusterShell upstream sync.
 - `ai-item-review.yml` — a reusable `workflow_call` gate used by the watcher.
 
+## Hydra projection
+
+The root flake routes its package and check projections through the pinned
+`hydra-src` CI helper for the three supported systems. Its `hydraJobs` output
+mirrors those package derivations for consumers; it only exposes derivations
+and does not enable or mutate a Hydra jobset.
+
 ## Secret on disk
 
 `.env.local` holds a live GitHub PAT. It is correctly gitignored

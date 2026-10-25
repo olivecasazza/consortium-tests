@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    hydra-src = {
+      url = "github:olivecasazza/hydra/4060fb888f85b3c273ac56cae665e7c99e99fe1c";
+      flake = false;
+    };
 
     # Declarative NixOS microVMs for the 64-node fanout64 benchmark. This repo
     # owns the fleet; `consortium` supplies the CLI that runs inside each guest
@@ -49,10 +53,12 @@
       nixpkgs,
       consortium,
       context-engineering-kit,
+      hydra-src,
       ...
     }:
     let
       inherit (nixpkgs) lib;
+      ci = import (hydra-src + "/lib/ci.nix") { inherit lib; };
       supportedSystems = [
         "aarch64-darwin"
         "aarch64-linux"
@@ -280,10 +286,21 @@
         };
 
       forEach = attr: lib.genAttrs supportedSystems (system: (perSystem system).${attr});
+      ciOutputs = ci.mkOutputs {
+        systems = supportedSystems;
+        packageSystems = supportedSystems;
+        checkSystems = [ "x86_64-linux" ];
+        # Publish Linux derivations for Hydra; Darwin remains a local
+        # package system and is not advertised as a PR check or Hydra worker.
+        hydraSystems = [
+          "x86_64-linux"
+          "aarch64-linux"
+        ];
+        buildFor = perSystem;
+      };
     in
     {
-      checks = forEach "checks";
-      packages = forEach "packages";
+      inherit (ciOutputs) packages checks hydraJobs;
       devShells = forEach "devShells";
       apps = forEach "apps";
     };
