@@ -153,6 +153,23 @@
         "type": "github"
       }
     },
+    "hydra-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792956539,
+        "narHash": "sha256-uGKavEWcqdgBPKLUp8W6lzzO+ffSDdotgFjTSU+2JiQ=",
+        "owner": "olivecasazza",
+        "repo": "hydra",
+        "rev": "4060fb888f85b3c273ac56cae665e7c99e99fe1c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "olivecasazza",
+        "repo": "hydra",
+        "rev": "4060fb888f85b3c273ac56cae665e7c99e99fe1c",
+        "type": "github"
+      }
+    },
     "microvm-nix": {
       "inputs": {
         "nixpkgs": [
@@ -247,6 +264,7 @@
       "inputs": {
         "consortium": "consortium",
         "context-engineering-kit": "context-engineering-kit_2",
+        "hydra-src": "hydra-src",
         "microvm-nix": "microvm-nix_2",
         "nixpkgs": "nixpkgs_2"
       }
