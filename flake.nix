@@ -289,9 +289,9 @@
       ciOutputs = ci.mkOutputs {
         systems = supportedSystems;
         packageSystems = supportedSystems;
-        checkSystems = supportedSystems;
-        # Publish Linux derivations for Hydra; Darwin remains a local supported
-        # package/check system and is not advertised as a Hydra worker.
+        checkSystems = [ "x86_64-linux" ];
+        # Publish Linux derivations for Hydra; Darwin remains a local
+        # package system and is not advertised as a PR check or Hydra worker.
         hydraSystems = [
           "x86_64-linux"
           "aarch64-linux"
