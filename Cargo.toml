@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/consortium-py",
     "crates/test-harness",
     "crates/integration-tests",
 ]

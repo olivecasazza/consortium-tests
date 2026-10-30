@@ -73,9 +73,11 @@
 
           # Interpreter for the dev shell: the parity suite's pytest
           # dependencies, which the repo's broken `.venv` no longer provides.
-          pythonEnv = pkgs.python3.withPackages (ps: [
+          pythonEnv = pkgs.python312.withPackages (ps: [
             ps.pytest
             ps.pytest-timeout
+            ps.pytest-xdist
+            ps.maturin
             ps.pyyaml
           ]);
 
@@ -228,6 +230,7 @@
             # shellHook below puts a working interpreter on PATH.
             packages = [
               pkgs.cargo
+              pkgs.rustc
               pkgs.nix
               # The relay-check tests shell out to the real verifier; without
               # it they fail (never skip) on the missing binary.

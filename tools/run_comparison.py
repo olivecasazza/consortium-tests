@@ -63,7 +63,7 @@ def main():
 
     consortium_repo = resolve_consortium_repo(args.consortium_repo)
     consortium_manifest = consortium_repo / "Cargo.toml"
-    consortium_py = consortium_repo / "crates" / "consortium-py"
+    consortium_py = REPO_ROOT / "crates" / "consortium-py"
 
     results_dir = REPO_ROOT / args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)

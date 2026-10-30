@@ -7,6 +7,9 @@ a Rust reimplementation of the ClusterShell toolchain. This repo owns:
   (`tests/`) synced from `cea-hpc/clustershell` at the ref pinned in
   `UPSTREAM_REF`, run against both the pure-Python oracle and the Rust
   (PyO3) bindings.
+- **Rust parity bridge** — `crates/consortium-py/` owns the PyO3 extension
+  and Python compatibility shims; it depends on the sibling consortium Rust core.
+  Python usage samples live in `examples/python/`.
 - **Python oracle** — the vendored upstream implementation (`lib/ClusterShell/`),
   used as the reference backend and as the fallback for not-yet-ported modules.
 - **Comparison harness** (`tools/`) — sync, mapping, and scorecard tooling:
@@ -76,16 +79,15 @@ CONSORTIUM_BACKEND=python PYTHONPATH=lib .venv/bin/python -m pytest tests/
 **Rust backend** — build the bindings into this repo's venv first:
 
 ```sh
-cd ../consortium/crates/consortium-py
+cd crates/consortium-py
 /path/to/consortium-tests/.venv/bin/maturin develop
-cd ../../../consortium-tests
+cd ../..
 CONSORTIUM_BACKEND=rust .venv/bin/python -m pytest tests/
 ```
 
 (`maturin develop` installs an editable `.pth` into the venv pointing at
-`../consortium/crates/consortium-py`; the ClusterShell shim resolves the
-oracle tree from this repo's `lib/` automatically in the sibling-checkout
-layout, or via the `LIB_CLUSTERSHELL` env var.)
+`crates/consortium-py`; the ClusterShell shim resolves the oracle tree
+from this repo's `lib/` automatically, or via `LIB_CLUSTERSHELL`.)
 
 **Regenerate the test mapping** (scans Rust tests in the consortium repo):
 
