@@ -77,7 +77,6 @@
             ps.pytest
             ps.pytest-timeout
             ps.pytest-xdist
-            ps.maturin
             ps.pyyaml
           ]);
 
@@ -231,6 +230,7 @@
             packages = [
               pkgs.cargo
               pkgs.rustc
+              pkgs.maturin
               pkgs.nix
               # The relay-check tests shell out to the real verifier; without
               # it they fail (never skip) on the missing binary.
