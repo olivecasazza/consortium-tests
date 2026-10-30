@@ -1,0 +1,19 @@
+[package]
+name = "consortium-py"
+version = "0.3.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Python bindings for consortium (ClusterShell-compatible API)"
+
+[lib]
+name = "_consortium"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+pyo3-build-config = { version = "0.22", default-features = false }
+
+[dependencies]
+consortium.workspace = true
+pyo3 = { version = "0.22", features = ["extension-module"] }

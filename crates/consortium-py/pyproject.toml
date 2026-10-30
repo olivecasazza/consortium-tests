@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ClusterShell"
+version = "0.1.0"
+description = "Rust-backed ClusterShell — drop-in replacement via consortium"
+requires-python = ">=3.9"
+license = { text = "LGPL-2.1-or-later" }
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "ClusterShell._consortium"

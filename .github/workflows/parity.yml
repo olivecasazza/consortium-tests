@@ -82,10 +82,11 @@ jobs:
 
       # ── Build ──────────────────────────────────────────────────
       - name: Build PyO3 bindings
-        working-directory: consortium/crates/consortium-py
+        working-directory: consortium-tests/crates/consortium-py
         run: |
           source "$GITHUB_WORKSPACE/consortium-tests/.venv/bin/activate"
           maturin develop --release
+          python tests/nix_smoke.py
 
       # ── Rust unit tests ────────────────────────────────────────
       - name: Run Rust unit tests
