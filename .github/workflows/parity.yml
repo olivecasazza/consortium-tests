@@ -177,6 +177,14 @@ jobs:
             --tb=short \
             --junit-xml=results/python-rust.xml
 
+      - name: Run upstream gather cases against native claw
+        if: ${{ !cancelled() }}
+        run: |
+          source .venv/bin/activate
+          cargo build --locked --manifest-path ../consortium/Cargo.toml \
+            -p consortium-cli --bin claw --target-dir ../consortium/target
+          python tools/run_native_claw.py --claw ../consortium/target/debug/claw
+
       # ── Generate scorecard ─────────────────────────────────────
       - name: Generate test mapping
         if: always()
