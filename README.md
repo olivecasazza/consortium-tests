@@ -89,6 +89,17 @@ CONSORTIUM_BACKEND=rust .venv/bin/python -m pytest tests/
 `crates/consortium-py`; the ClusterShell shim resolves the oracle tree
 from this repo's `lib/` automatically, or via `LIB_CLUSTERSHELL`.)
 
+**Native `claw`** — run both calls in upstream `test_036_sorted_gather` and
+all five in `test_046_axis` directly against the binary. These local exec cases
+use the original arguments and expected bytes; the rest of the Python suite
+continues to test the oracle and bindings, not the binary.
+
+```sh
+cargo build --locked --manifest-path ../consortium/Cargo.toml \
+  -p consortium-cli --bin claw --target-dir ../consortium/target
+.venv/bin/python tools/run_native_claw.py --claw ../consortium/target/debug/claw
+```
+
 **Regenerate the test mapping** (scans Rust tests in the consortium repo):
 
 ```sh
